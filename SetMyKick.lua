@@ -24,6 +24,15 @@ local DEFAULT_MACRO =
 	"/focus [@focus,noexists] target\n" ..
 	"/tm [@target,noexists][@target,dead] {kick}; {kick}"
 
+-- Selectable macro templates ({interrupt} = your spec's interrupt, {kick} = marker).
+local TEMPLATES = {
+	{ name = "Focus + Kick (set focus, then interrupt)", body = DEFAULT_MACRO },
+	{ name = "Set focus only (and mark)",
+	  body = "#showtooltip\n/focus target\n/tm [@target,noexists][@target,dead] {kick}; {kick}" },
+	{ name = "Kick focus only (and mark)",
+	  body = "#showtooltip {interrupt}\n/cast [@focus,harm,nodead] {interrupt}\n/tm [@target,noexists][@target,dead] {kick}; {kick}" },
+}
+
 local DEFAULTS = {
 	marker               = 8,            -- 1..8 raid target index, 0 = no marker (skull default)
 	showOnReadyCheck     = true,         -- show on ready check while in a Mythic+ dungeon
@@ -203,11 +212,17 @@ local function MakeCheck(parent, label, x, y, get, set)
 	return cb
 end
 
+local function RefreshDragIcon()
+	if not frame or not frame.dragIcon then return end
+	local id = GetMyInterruptID()
+	frame.dragIcon:SetTexture((id and C_Spell.GetSpellTexture(id)) or 134400)
+end
+
 local function CreateUI()
 	if frame then return frame end
 
 	frame = CreateFrame("Frame", "SetMyKickFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(300, 376)
+	frame:SetSize(300, 440)
 	frame:SetFrameStrata("DIALOG")
 	frame:SetToplevel(true)
 	frame:SetClampedToScreen(true)
@@ -329,6 +344,40 @@ local function CreateUI()
 	macroBtn:SetText("Edit Macro...")
 	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
 
+	-- Drag-to-bars: pick up the managed macro so new users can drop it on a bar.
+	local dragLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	dragLabel:SetPoint("TOP", 0, -366)
+	dragLabel:SetText("New? Drag this macro to your action bar:")
+
+	local dragBox = CreateFrame("Button", nil, frame)
+	dragBox:SetSize(40, 40)
+	dragBox:SetPoint("TOP", 0, -384)
+	dragBox:RegisterForDrag("LeftButton")
+	dragBox:RegisterForClicks("LeftButtonUp")
+	local dicon = dragBox:CreateTexture(nil, "ARTWORK")
+	dicon:SetAllPoints()
+	dragBox:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+	frame.dragIcon = dicon
+
+	local function PickupTheMacro()
+		if InCombatLockdown() then return end
+		local name = DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
+		DB.macroEnabled = true
+		UpdateManagedMacro()
+		local idx = GetMacroIndexByName(name)
+		if idx and idx > 0 then PickupMacro(idx) end
+	end
+	dragBox:SetScript("OnDragStart", PickupTheMacro)
+	dragBox:SetScript("OnClick", PickupTheMacro)
+	dragBox:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+		GameTooltip:SetText("Set My Kick macro")
+		GameTooltip:AddLine("Drag onto an action bar, or click to pick it up then click a bar slot.", 1, 1, 1, true)
+		GameTooltip:Show()
+	end)
+	dragBox:SetScript("OnLeave", GameTooltip_Hide)
+	RefreshDragIcon()
+
 	local p = DB.point or DEFAULTS.point
 	frame:ClearAllPoints()
 	frame:SetPoint(p[1], UIParent, p[2], p[3], p[4])
@@ -347,6 +396,7 @@ local function ShowUI()
 	frame.readyCB:Refresh()
 	frame.autoCB:Refresh()
 	frame.msgBox:SetText(DB.message or DEFAULTS.message)
+	RefreshDragIcon()
 	UpdateManagedMacro()
 	frame:Show()
 	frame:Raise()
@@ -489,13 +539,17 @@ function SetMyKick_ShowMacroEditor()
 		UpdateManagedMacro(true)
 	end)
 
-	local resetBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
-	resetBtn:SetSize(170, 24)
-	resetBtn:SetPoint("BOTTOMRIGHT", -30, 18)
-	resetBtn:SetText("Reset to Default")
-	resetBtn:SetScript("OnClick", function()
-		scroll.EditBox:SetText(DEFAULT_MACRO)
-		nameBox:SetText(DEFAULTS.macroName)
+	local templateDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
+	templateDrop:SetSize(190, 24)
+	templateDrop:SetPoint("BOTTOMRIGHT", -30, 18)
+	templateDrop:SetDefaultText("Choose a template...")
+	templateDrop:SetupMenu(function(dropdown, root)
+		for _, t in ipairs(TEMPLATES) do
+			local body = t.body
+			root:CreateButton(t.name, function()
+				scroll.EditBox:SetText(body)
+			end)
+		end
 	end)
 
 	local p = DB.macroPoint or DEFAULTS.macroPoint

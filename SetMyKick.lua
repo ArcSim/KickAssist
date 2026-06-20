@@ -52,6 +52,8 @@ local TEMPLATES = {
 		{ name = "Focus + Kick (default, re-press to kick)", body = DEFAULT_MACRO },
 		{ name = "Focus + Kick (Ctrl to kick your target)",
 		  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+		{ name = "Focus + Kick (mouseover)",
+		  body = "#showtooltip {interrupt}\n/cast [@focus,harm,nodead] {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
 	},
 	focus = {
 		{ name = "Set focus (target)", body = SET_FOCUS_MACRO },
@@ -538,10 +540,10 @@ end
 
 function SetMyKick_ShowMacroEditor()
 	if macroFrame then
-		macroFrame.ReloadFields()
 		macroFrame.note:SetText(MacroNoteText())
 		macroFrame:Show()
 		macroFrame:Raise()
+		macroFrame.ReloadFields()
 		return
 	end
 
@@ -718,13 +720,12 @@ function SetMyKick_ShowMacroEditor()
 		end
 	end)
 
-	ReloadFields()
-
 	local p = DB.macroPoint or DEFAULTS.macroPoint
 	macroFrame:ClearAllPoints()
 	macroFrame:SetPoint(p[1], UIParent, p[2], p[3], p[4])
 	macroFrame:Show()
 	macroFrame:Raise()
+	ReloadFields()
 end
 
 --------------------------------------------------------------------------------

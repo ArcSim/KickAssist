@@ -1,7 +1,7 @@
 local ADDON = ...
 
 --------------------------------------------------------------------------------
--- Set My Focus Kick
+-- Kick Assist
 -- Pick your interrupt (kick) raid marker, announce it to the group, and keep
 -- your interrupt macro's marker number in sync with your pick. The popup
 -- auto-shows on ready check and / or Mythic+ start.
@@ -120,7 +120,7 @@ local MARKER_NAMES = {
 	"Star", "Circle", "Diamond", "Triangle", "Moon", "Square", "Cross", "Skull",
 }
 
-local PREFIX = "|cff33ff99Set My Focus Kick|r: "
+local PREFIX = "|cff33ff99Kick Assist|r: "
 local QUESTION_ICON = "INV_Misc_QuestionMark"
 local FOCUS_ICON = 132212  -- set-focus macro icon (fileID)
 
@@ -375,7 +375,7 @@ local function CreateUI()
 
 	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("TOP", 0, -16)
-	title:SetText("Set My Focus Kick")
+	title:SetText("Kick Assist")
 
 	local instr = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
 	instr:SetPoint("TOP", title, "BOTTOM", 0, -6)
@@ -828,7 +828,7 @@ local function CreateMinimapButton()
 
 	b:SetScript("OnEnter", function(self)
 		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
-		GameTooltip:SetText("Set My Focus Kick")
+		GameTooltip:SetText("Kick Assist")
 		GameTooltip:AddLine("Left-click: open window", 1, 1, 1)
 		GameTooltip:AddLine("Right-click: options", 1, 1, 1)
 		GameTooltip:AddLine("Drag: move button", 1, 1, 1)
@@ -844,11 +844,11 @@ end
 local function CreateSettingsPanel()
 	if settingsCategory then return end
 	local panel = CreateFrame("Frame", "SetMyKickSettingsPanel")
-	panel.name = "Set My Focus Kick"
+	panel.name = "Kick Assist"
 
 	local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
 	title:SetPoint("TOPLEFT", 16, -16)
-	title:SetText("Set My Focus Kick")
+	title:SetText("Kick Assist")
 
 	local desc = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
 	desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
@@ -859,7 +859,7 @@ local function CreateSettingsPanel()
 	local openBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
 	openBtn:SetSize(220, 26)
 	openBtn:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", 0, -16)
-	openBtn:SetText("Open Set My Focus Kick Window")
+	openBtn:SetText("Open Kick Assist Window")
 	openBtn:SetScript("OnClick", function() ShowUI() end)
 
 	local macroBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
@@ -879,7 +879,7 @@ local function CreateSettingsPanel()
 	mmLabel:SetPoint("LEFT", mmCB, "RIGHT", 2, 0)
 	mmLabel:SetText("Show minimap button")
 
-	local category = Settings.RegisterCanvasLayoutCategory(panel, "Set My Focus Kick")
+	local category = Settings.RegisterCanvasLayoutCategory(panel, "Kick Assist")
 	Settings.RegisterAddOnCategory(category)
 	settingsCategory = category
 end

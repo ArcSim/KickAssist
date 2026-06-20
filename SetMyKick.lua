@@ -33,25 +33,21 @@ local SET_FOCUS_MACRO =
 	"/focus target\n" ..
 	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
 
--- Two-press variant: press once to set focus, again to kick it.
-local TWO_PRESS_MACRO =
-	"#showtooltip {interrupt}\n" ..
-	"/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n" ..
-	"/focus [@focus,noexists] target\n" ..
-	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
-
--- Kick focus + mark, no auto-focus.
-local KICK_FOCUS_MACRO =
-	"#showtooltip {interrupt}\n" ..
-	"/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n" ..
-	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
-
--- Templates for the customizable Focus+Kick macro.
+-- Templates you can load into either macro from the editor. All mark with ~{kick}
+-- so re-pressing never removes your own mark.
 local TEMPLATES = {
-	{ name = "Focus + Kick (single press)", body = DEFAULT_MACRO },
-	{ name = "Focus + Kick (press to focus, again to kick)", body = TWO_PRESS_MACRO },
-	{ name = "Set focus only (and mark)", body = SET_FOCUS_MACRO },
-	{ name = "Kick focus only (and mark)", body = KICK_FOCUS_MACRO },
+	{ name = "Focus + Kick (Ctrl to snipe)", body = DEFAULT_MACRO },
+	{ name = "Focus + Kick (no modifier)",
+	  body = "#showtooltip {interrupt}\n/focus [@focus,noexists] target\n/cast [@focus,harm,nodead][] {interrupt}\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+	{ name = "Focus + Kick (press to focus, again to kick)",
+	  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+	{ name = "Mouseover Kick (Ctrl to snipe)",
+	  body = "#showtooltip {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/tm [@mouseover,exists][] ~{kick}" },
+	{ name = "Set focus + mark (target)", body = SET_FOCUS_MACRO },
+	{ name = "Set focus + mark (mouseover)",
+	  body = "#showtooltip\n/focus [@mouseover,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
+	{ name = "Kick focus only (and mark)",
+	  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
 }
 
 local DEFAULTS = {
@@ -62,9 +58,10 @@ local DEFAULTS = {
 	point                = { "CENTER", "CENTER", 0, 140 },
 
 	macroEnabled         = false,        -- opt-in: do not touch macros until the user enables it
-	macroName            = "FocusKick",  -- set-focus-and-kick macro (customizable)
+	macroName            = "FocusKick",  -- set-focus-and-kick macro
 	macroTemplate        = DEFAULT_MACRO,
-	setFocusName         = "SetFocus",   -- set-focus-and-mark macro (fixed)
+	setFocusName         = "SetFocus",   -- set-focus-and-mark macro
+	setFocusTemplate     = SET_FOCUS_MACRO,
 	macroPoint           = { "CENTER", "CENTER", 0, 0 },
 
 	minimap              = { angle = 214, hide = false },
@@ -202,13 +199,18 @@ local function UpdateManagedMacro(verbose)
 end
 
 -- The fixed "set focus + mark" macro. Synced if it exists; created when create=true.
-local function UpdateSetFocusMacro(create)
-	if InCombatLockdown() then return end
+local function UpdateSetFocusMacro(create, verbose)
+	if InCombatLockdown() then
+		if verbose then print(PREFIX .. "macro will update after combat.") end
+		return
+	end
 	local name = DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName
-	local body = SET_FOCUS_MACRO:gsub("{kick}", tostring(DB.marker))
+	local interrupt = GetMyInterruptName() or ""
+	local body = tostring(DB.setFocusTemplate or SET_FOCUS_MACRO):gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
 	local idx = GetMacroIndexByName(name)
 	if idx and idx > 0 then
 		EditMacro(idx, name, QUESTION_ICON, body)
+		if verbose then print(PREFIX .. "updated macro '" .. name .. "'.") end
 	elseif create then
 		local _, numChar = GetNumMacros()
 		if numChar and numChar >= MAX_CHARACTER_MACROS then
@@ -216,6 +218,7 @@ local function UpdateSetFocusMacro(create)
 			return
 		end
 		CreateMacro(name, QUESTION_ICON, body, true)
+		if verbose then print(PREFIX .. "created macro '" .. name .. "'. Drag it to your bars.") end
 	end
 end
 
@@ -487,6 +490,8 @@ SetMyKick_Show = ShowUI
 -- Macro editor UI
 --------------------------------------------------------------------------------
 
+local editorSlot = "kick"  -- which macro the editor edits: "kick" or "focus"
+
 local function MacroNoteText()
 	return "{interrupt} fills in your interrupt (now: " ..
 		(GetMyInterruptName() or "none for this spec") .. "); {kick} fills in your marker."
@@ -494,8 +499,7 @@ end
 
 function SetMyKick_ShowMacroEditor()
 	if macroFrame then
-		macroFrame.nameBox:SetText(DB.macroName or DEFAULTS.macroName)
-		macroFrame.scroll.EditBox:SetText(DB.macroTemplate or DEFAULT_MACRO)
+		macroFrame.ReloadFields()
 		macroFrame.note:SetText(MacroNoteText())
 		macroFrame:Show()
 		macroFrame:Raise()
@@ -503,7 +507,7 @@ function SetMyKick_ShowMacroEditor()
 	end
 
 	macroFrame = CreateFrame("Frame", "SetMyKickMacroFrame", UIParent, "BackdropTemplate")
-	macroFrame:SetSize(420, 330)
+	macroFrame:SetSize(420, 380)
 	macroFrame:SetFrameStrata("DIALOG")
 	macroFrame:SetToplevel(true)
 	macroFrame:SetClampedToScreen(true)
@@ -529,40 +533,38 @@ function SetMyKick_ShowMacroEditor()
 
 	local title = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
 	title:SetPoint("TOP", 0, -16)
-	title:SetText("Edit Kick Macro")
+	title:SetText("Edit Macro")
 
 	local nameLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	nameLabel:SetPoint("TOPLEFT", 24, -46)
+	nameLabel:SetPoint("TOPLEFT", 24, -80)
 	nameLabel:SetText("Macro name:")
 
 	local nameBox = CreateFrame("EditBox", nil, macroFrame, "InputBoxTemplate")
 	nameBox:SetSize(130, 20)
 	nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
 	nameBox:SetAutoFocus(false)
-	nameBox:SetText(DB.macroName or DEFAULTS.macroName)
 	nameBox:SetScript("OnEscapePressed", nameBox.ClearFocus)
 	nameBox:SetScript("OnEnterPressed", nameBox.ClearFocus)
 	macroFrame.nameBox = nameBox
 
 	local note = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	note:SetPoint("TOPLEFT", 24, -72)
-	note:SetPoint("TOPRIGHT", -24, -72)
+	note:SetPoint("TOPLEFT", 24, -106)
+	note:SetPoint("TOPRIGHT", -24, -106)
 	note:SetJustifyH("LEFT")
 	macroFrame.note = note
 	note:SetText(MacroNoteText())
 
 	local bodyLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
-	bodyLabel:SetPoint("TOPLEFT", 24, -100)
-	bodyLabel:SetText("Macro body (use {kick} where the marker number goes):")
+	bodyLabel:SetPoint("TOPLEFT", 24, -132)
+	bodyLabel:SetText("Macro body ({interrupt} and {kick} are filled in for you):")
 
 	local scroll = CreateFrame("ScrollFrame", "SetMyKickMacroScroll", macroFrame, "InputScrollFrameTemplate")
-	scroll:SetSize(372, 100)
-	scroll:SetPoint("TOPLEFT", 24, -120)
+	scroll:SetSize(372, 96)
+	scroll:SetPoint("TOPLEFT", 24, -152)
 	scroll.EditBox:SetMultiLine(true)
 	scroll.EditBox:SetMaxLetters(255)
 	scroll.EditBox:SetWidth(360)
 	scroll.EditBox:SetFontObject(ChatFontNormal)
-	scroll.EditBox:SetText(DB.macroTemplate or DEFAULT_MACRO)
 	if scroll.CharCount then scroll.CharCount:Hide() end
 	macroFrame.scroll = scroll
 
@@ -574,6 +576,48 @@ function SetMyKick_ShowMacroEditor()
 		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
 		edgeSize = 12,
 	})
+
+	-- Which macro this editor is editing.
+	local function CurrentName()
+		if editorSlot == "focus" then return DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName end
+		return DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
+	end
+	local function CurrentTemplate()
+		if editorSlot == "focus" then return DB.setFocusTemplate or SET_FOCUS_MACRO end
+		return DB.macroTemplate or DEFAULT_MACRO
+	end
+	local function ReloadFields()
+		nameBox:SetText(CurrentName())
+		scroll.EditBox:SetText(CurrentTemplate())
+	end
+	local function ApplySlot(name, template)
+		if editorSlot == "focus" then
+			DB.setFocusName = name
+			DB.setFocusTemplate = template
+			UpdateSetFocusMacro(true, true)
+		else
+			DB.macroName = name
+			DB.macroTemplate = template
+			DB.macroEnabled = true
+			UpdateManagedMacro(true)
+		end
+	end
+	macroFrame.ReloadFields = ReloadFields
+
+	-- Slot selector: pick which macro to edit.
+	local editLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	editLabel:SetPoint("TOPLEFT", 24, -50)
+	editLabel:SetText("Editing:")
+
+	local function SlotText() return (editorSlot == "focus") and "Set Focus" or "Focus + Kick" end
+	local slotDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
+	slotDrop:SetSize(160, 22)
+	slotDrop:SetPoint("LEFT", editLabel, "RIGHT", 10, 0)
+	slotDrop:SetupMenu(function(dropdown, root)
+		root:CreateButton("Focus + Kick", function() editorSlot = "kick"; ReloadFields(); slotDrop:SetText(SlotText()) end)
+		root:CreateButton("Set Focus", function() editorSlot = "focus"; ReloadFields(); slotDrop:SetText(SlotText()) end)
+	end)
+	slotDrop:SetText(SlotText())
 
 	-- Pick an existing macro to manage; loads its name + body so you can add {kick}.
 	local macroDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
@@ -597,23 +641,20 @@ function SetMyKick_ShowMacroEditor()
 	end)
 
 	local info = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
-	info:SetPoint("TOPLEFT", 24, -230)
-	info:SetPoint("TOPRIGHT", -24, -230)
+	info:SetPoint("TOPLEFT", 24, -256)
+	info:SetPoint("TOPRIGHT", -24, -256)
 	info:SetJustifyH("LEFT")
-	info:SetText("Keep {kick} somewhere in the macro (you can move it, just don't delete it). Saving updates the macro; the marker re-syncs when you pick. Drag it to your bars.")
+	info:SetText("Keep {kick} in the macro (you can move it, just don't delete it). Saving updates the chosen macro; the marker re-syncs when you pick. Drag it to your bars.")
 
 	local saveBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
 	saveBtn:SetSize(170, 24)
 	saveBtn:SetPoint("BOTTOMLEFT", 30, 18)
 	saveBtn:SetText("Save & Update Macro")
 	saveBtn:SetScript("OnClick", function()
-		local nm = nameBox:GetText()
-		nm = (nm or ""):gsub("^%s+", ""):gsub("%s+$", "")
-		DB.macroName     = nm ~= "" and nm or DEFAULTS.macroName
-		DB.macroTemplate = scroll.EditBox:GetText()
-		DB.macroEnabled  = true
-		nameBox:SetText(DB.macroName)
-		UpdateManagedMacro(true)
+		local nm = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if nm == "" then nm = CurrentName() end
+		ApplySlot(nm, scroll.EditBox:GetText())
+		nameBox:SetText(nm)
 	end)
 
 	local templateDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
@@ -621,19 +662,20 @@ function SetMyKick_ShowMacroEditor()
 	templateDrop:SetPoint("BOTTOMRIGHT", -30, 18)
 	templateDrop:SetDefaultText("Choose a template...")
 	templateDrop:SetupMenu(function(dropdown, root)
+		root:SetScrollMode(20 * 16)
 		for _, t in ipairs(TEMPLATES) do
 			local body = t.body
 			root:CreateButton(t.name, function()
 				scroll.EditBox:SetText(body)
 				local nm = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
-				DB.macroName     = nm ~= "" and nm or DEFAULTS.macroName
-				DB.macroTemplate = body
-				DB.macroEnabled  = true
-				nameBox:SetText(DB.macroName)
-				UpdateManagedMacro(true)
+				if nm == "" then nm = CurrentName() end
+				ApplySlot(nm, body)
+				nameBox:SetText(nm)
 			end)
 		end
 	end)
+
+	ReloadFields()
 
 	local p = DB.macroPoint or DEFAULTS.macroPoint
 	macroFrame:ClearAllPoints()

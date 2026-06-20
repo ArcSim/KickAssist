@@ -333,6 +333,7 @@ local function CreateUI()
 		tile = true, tileSize = 32, edgeSize = 32,
 		insets = { left = 11, right = 12, top = 12, bottom = 11 },
 	})
+	frame:SetBackdropColor(1, 1, 1, 0.95)
 
 	frame:SetMovable(true)
 	frame:EnableMouse(true)
@@ -558,6 +559,7 @@ function SetMyKick_ShowMacroEditor()
 		tile = true, tileSize = 32, edgeSize = 32,
 		insets = { left = 11, right = 12, top = 12, bottom = 11 },
 	})
+	macroFrame:SetBackdropColor(1, 1, 1, 0.95)
 	macroFrame:SetMovable(true)
 	macroFrame:EnableMouse(true)
 	macroFrame:RegisterForDrag("LeftButton")
@@ -630,7 +632,10 @@ function SetMyKick_ShowMacroEditor()
 	end
 	local function ReloadFields()
 		nameBox:SetText(CurrentName())
+		nameBox:SetCursorPosition(0)
 		scroll.EditBox:SetText(CurrentTemplate())
+		scroll.EditBox:SetCursorPosition(0)
+		scroll:SetVerticalScroll(0)
 	end
 	local function ApplySlot(name, template)
 		local cfg = SLOT_CFG[editorSlot]
@@ -659,7 +664,7 @@ function SetMyKick_ShowMacroEditor()
 	slotDrop:SetupMenu(function(dropdown, root)
 		for _, key in ipairs(SLOT_ORDER) do
 			local sk = key
-			root:CreateButton(SLOT_CFG[sk].label, function() editorSlot = sk; ReloadFields(); slotDrop:SetText(SlotText()) end)
+			root:CreateButton(SLOT_CFG[sk].label, function() editorSlot = sk; slotDrop:SetText(SlotText()); C_Timer.After(0, ReloadFields) end)
 		end
 	end)
 	slotDrop:SetText(SlotText())

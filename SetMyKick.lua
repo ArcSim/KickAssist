@@ -1,0 +1,691 @@
+local ADDON = ...
+
+--------------------------------------------------------------------------------
+-- Set My Kick
+-- Pick your interrupt (kick) raid marker, announce it to the group, and keep
+-- your interrupt macro's marker number in sync with your pick. The popup
+-- auto-shows on ready check and / or Mythic+ start.
+--
+-- Marking note: SetRaidTarget is a PROTECTED function (addons may not call it).
+-- The game already ships a secure /tm command (Blizzard's TARGET_MARKER slash)
+-- that does the marking. This addon never calls SetRaidTarget and never registers
+-- /tm; it only rewrites the marker NUMBER inside your macro so the built-in /tm
+-- marks with whatever you picked.
+--
+-- Announce note: a message sent from a button click is always allowed. Automated
+-- announce on the trigger works outside instanced content; inside an instance it
+-- can be blocked, in which case the button still works.
+--------------------------------------------------------------------------------
+
+-- {interrupt} resolves to your spec's interrupt spell, {kick} to your marker.
+local DEFAULT_MACRO =
+	"#showtooltip {interrupt}\n" ..
+	"/cast [@focus,harm,nodead] {interrupt}\n" ..
+	"/focus [@focus,noexists] target\n" ..
+	"/tm [@target,noexists][@target,dead] {kick}; {kick}"
+
+local DEFAULTS = {
+	marker               = 8,            -- 1..8 raid target index, 0 = no marker (skull default)
+	showOnReadyCheck     = true,         -- show on ready check while in a Mythic+ dungeon
+	autoAnnounce         = false,        -- announce automatically when the popup opens (off: click to announce)
+	message              = "Kicking %MARKER%",
+	point                = { "CENTER", "CENTER", 0, 140 },
+
+	macroEnabled         = false,        -- opt-in: do not touch macros until the user enables it
+	macroName            = "Focus",
+	macroTemplate        = DEFAULT_MACRO,
+	macroPoint           = { "CENTER", "CENTER", 0, 0 },
+
+	minimap              = { angle = 214, hide = false },
+}
+
+local MARKER_NAMES = {
+	[0] = "No Marker",
+	"Star", "Circle", "Diamond", "Triangle", "Moon", "Square", "Cross", "Skull",
+}
+
+local PREFIX = "|cff33ff99Set My Kick|r: "
+local QUESTION_ICON = "INV_Misc_QuestionMark"
+
+local DB           -- resolved at ADDON_LOADED
+local frame        -- main popup, created lazily
+local macroFrame   -- macro editor, created lazily
+
+--------------------------------------------------------------------------------
+-- Helpers
+--------------------------------------------------------------------------------
+
+-- Chat substitution token for a raid marker; the chat system renders the icon.
+local function ChatToken(index)
+	if index and index >= 1 and index <= 8 then
+		return "{rt" .. index .. "}"
+	end
+	return "no marker"
+end
+
+-- Set a texture to a single cell of the 4x4 raid-target sprite sheet.
+local function SetMarkerTexture(tex, index)
+	tex:SetTexture("Interface\\TargetingFrame\\UI-RaidTargetingIcons")
+	local col  = (index - 1) % 4
+	local row  = math.floor((index - 1) / 4)
+	local left = col * 0.25
+	local top  = row * 0.25
+	tex:SetTexCoord(left, left + 0.25, top, top + 0.25)
+end
+
+-- Where group chat should go right now (nil = not grouped).
+local function GroupChannel()
+	if IsInGroup(LE_PARTY_CATEGORY_INSTANCE) then return "INSTANCE_CHAT" end
+	if IsInRaid() then return "RAID" end
+	if IsInGroup() then return "PARTY" end
+	return nil
+end
+
+-- True when in a Mythic+ / Mythic 5-player dungeon (covers both pre-key staging
+-- and an active key). Difficulty 8 = Mythic Keystone, 23 = Mythic (DifficultyUtil).
+local function InMythicDungeon()
+	local inInstance, instanceType = IsInInstance()
+	if not inInstance or instanceType ~= "party" then return false end
+	local difficultyID = select(3, GetInstanceInfo())
+	return difficultyID == 8 or difficultyID == 23
+end
+
+-- Interrupt ("kick") spell per class, with spec overrides keyed by specialization
+-- ID. Verified against warcraft.wiki.gg/wiki/Interrupt. Missing = spec has no kick.
+local INTERRUPTS = {
+	DEATHKNIGHT = { default = 47528  },                  -- Mind Freeze
+	DEMONHUNTER = { default = 183752 },                  -- Disrupt
+	DRUID       = { default = 106839, [102] = 78675  },  -- Skull Bash; Balance = Solar Beam
+	EVOKER      = { default = 351338 },                  -- Quell
+	HUNTER      = { default = 147362, [255] = 187707 },  -- Counter Shot; Survival = Muzzle
+	MAGE        = { default = 2139   },                  -- Counterspell
+	MONK        = { default = 116705 },                  -- Spear Hand Strike
+	PALADIN     = { default = 96231  },                  -- Rebuke (all specs)
+	PRIEST      = {                   [258] = 15487 },   -- Shadow = Silence; Disc/Holy none
+	ROGUE       = { default = 1766   },                  -- Kick
+	SHAMAN      = { default = 57994  },                  -- Wind Shear
+	WARLOCK     = { default = 19647  },                  -- Spell Lock (Felhunter pet)
+	WARRIOR     = { default = 6552   },                  -- Pummel
+}
+
+-- The current character's interrupt spell ID (nil if this spec has none).
+local function GetMyInterruptID()
+	local _, classToken = UnitClass("player")
+	local data = classToken and INTERRUPTS[classToken]
+	if not data then return nil end
+	local specIndex = GetSpecialization()
+	local specID = specIndex and GetSpecializationInfo(specIndex)
+	return (specID and data[specID]) or data.default
+end
+
+local function GetMyInterruptName()
+	local id = GetMyInterruptID()
+	return id and C_Spell.GetSpellName(id) or nil
+end
+
+-- Post the kick marker to group chat. Safe to call from a button OnClick (always
+-- allowed) and from the trigger (allowed outside instanced content).
+local function Announce()
+	local token   = ChatToken(DB.marker)
+	local msg     = (tostring(DB.message or DEFAULTS.message):gsub("%%MARKER%%", token))
+	local channel = GroupChannel()
+	if channel then
+		SendChatMessage(msg, channel)
+	else
+		print(PREFIX .. msg .. " (not in a group, shown locally)")
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Macro management (text only; the built-in /tm does the marking)
+--------------------------------------------------------------------------------
+
+-- Rewrite the managed macro so {kick} matches the chosen marker. Out of combat
+-- only (EditMacro / CreateMacro are blocked in combat).
+local function UpdateManagedMacro(verbose)
+	if not (DB and DB.macroEnabled) then return end
+	if InCombatLockdown() then
+		if verbose then print(PREFIX .. "macro will update after combat.") end
+		return
+	end
+
+	local name = DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
+	local interrupt = GetMyInterruptName() or ""
+	local body = tostring(DB.macroTemplate or DEFAULT_MACRO)
+	body = body:gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
+	if body == "" then return end
+
+	local idx = GetMacroIndexByName(name)
+	if idx and idx > 0 then
+		EditMacro(idx, name, QUESTION_ICON, body)
+		if verbose then print(PREFIX .. "updated macro '" .. name .. "'.") end
+	else
+		local _, numChar = GetNumMacros()
+		if numChar and numChar >= MAX_CHARACTER_MACROS then
+			print(PREFIX .. "no free character macro slots for '" .. name .. "'.")
+			return
+		end
+		CreateMacro(name, QUESTION_ICON, body, true) -- per-character
+		if verbose then print(PREFIX .. "created macro '" .. name .. "'. Drag it to your bars.") end
+	end
+end
+
+--------------------------------------------------------------------------------
+-- Main popup UI
+--------------------------------------------------------------------------------
+
+local function UpdateSelection()
+	if not frame then return end
+	for i = 1, 8 do
+		frame.markerButtons[i].sel:SetShown(DB.marker == i)
+	end
+	frame.noneButton.sel:SetShown(DB.marker == 0)
+end
+
+local function MakeSelTexture(parent)
+	local t = parent:CreateTexture(nil, "OVERLAY")
+	t:SetTexture("Interface\\Buttons\\CheckButtonHilight")
+	t:SetBlendMode("ADD")
+	t:SetPoint("TOPLEFT", -3, 3)
+	t:SetPoint("BOTTOMRIGHT", 3, -3)
+	t:Hide()
+	return t
+end
+
+local function MakeCheck(parent, label, x, y, get, set)
+	local cb = CreateFrame("CheckButton", nil, parent, "UICheckButtonTemplate")
+	cb:SetPoint("TOPLEFT", x, y)
+	cb:SetScript("OnClick", function(self) set(self:GetChecked() and true or false) end)
+	local fs = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	fs:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+	fs:SetText(label)
+	cb.Refresh = function(self) self:SetChecked(get() and true or false) end
+	return cb
+end
+
+local function CreateUI()
+	if frame then return frame end
+
+	frame = CreateFrame("Frame", "SetMyKickFrame", UIParent, "BackdropTemplate")
+	frame:SetSize(300, 376)
+	frame:SetFrameStrata("DIALOG")
+	frame:SetToplevel(true)
+	frame:SetClampedToScreen(true)
+	frame:SetBackdrop({
+		bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+		edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+		tile = true, tileSize = 32, edgeSize = 32,
+		insets = { left = 11, right = 12, top = 12, bottom = 11 },
+	})
+
+	frame:SetMovable(true)
+	frame:EnableMouse(true)
+	frame:RegisterForDrag("LeftButton")
+	frame:SetScript("OnDragStart", frame.StartMoving)
+	frame:SetScript("OnDragStop", function(self)
+		self:StopMovingOrSizing()
+		local p, _, rp, x, y = self:GetPoint()
+		DB.point = { p, rp, x, y }
+	end)
+
+	tinsert(UISpecialFrames, "SetMyKickFrame")
+
+	local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
+	close:SetPoint("TOPRIGHT", -4, -4)
+
+	local title = frame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	title:SetPoint("TOP", 0, -16)
+	title:SetText("Set My Kick")
+
+	local instr = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	instr:SetPoint("TOP", title, "BOTTOM", 0, -6)
+	instr:SetText("Pick your kick marker")
+
+	-- 8 marker buttons, 4 per row.
+	frame.markerButtons = {}
+	for i = 1, 8 do
+		local btn = CreateFrame("Button", nil, frame)
+		btn:SetSize(40, 40)
+		local col = (i - 1) % 4
+		local row = math.floor((i - 1) / 4)
+		btn:SetPoint("TOPLEFT", 55 + col * 50, -58 - row * 50)
+
+		local icon = btn:CreateTexture(nil, "ARTWORK")
+		icon:SetAllPoints()
+		SetMarkerTexture(icon, i)
+
+		btn.sel = MakeSelTexture(btn)
+		btn:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+		btn:SetScript("OnClick", function()
+			DB.marker = i
+			UpdateSelection()
+			UpdateManagedMacro()
+			Announce()
+		end)
+		btn:SetScript("OnEnter", function(self)
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText(MARKER_NAMES[i])
+			GameTooltip:Show()
+		end)
+		btn:SetScript("OnLeave", GameTooltip_Hide)
+
+		frame.markerButtons[i] = btn
+	end
+
+	-- "No Marker" choice.
+	local none = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	none:SetSize(100, 22)
+	none:SetPoint("TOP", 0, -162)
+	none:SetText("No Marker")
+	none.sel = MakeSelTexture(none)
+	none:SetScript("OnClick", function()
+		DB.marker = 0
+		UpdateSelection()
+		UpdateManagedMacro()
+	end)
+	frame.noneButton = none
+
+	-- Toggles.
+	frame.readyCB = MakeCheck(frame, "Show on ready check (in Mythic+)", 22, -196,
+		function() return DB.showOnReadyCheck end,
+		function(v) DB.showOnReadyCheck = v end)
+
+	frame.autoCB = MakeCheck(frame, "Auto-announce when opened", 22, -220,
+		function() return DB.autoAnnounce end,
+		function(v) DB.autoAnnounce = v end)
+
+	-- Editable announce message. %MARKER% is replaced with your marker icon.
+	local msgLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	msgLabel:SetPoint("TOPLEFT", 22, -250)
+	msgLabel:SetText("Message (%MARKER% = your icon):")
+
+	local msgBox = CreateFrame("EditBox", nil, frame, "InputBoxTemplate")
+	msgBox:SetSize(246, 20)
+	msgBox:SetPoint("TOPLEFT", 28, -268)
+	msgBox:SetAutoFocus(false)
+	msgBox:SetText(DB.message or DEFAULTS.message)
+	msgBox:SetScript("OnEscapePressed", msgBox.ClearFocus)
+	msgBox:SetScript("OnEnterPressed", function(self)
+		DB.message = self:GetText()
+		self:ClearFocus()
+	end)
+	msgBox:SetScript("OnEditFocusLost", function(self) DB.message = self:GetText() end)
+	frame.msgBox = msgBox
+
+	-- Announce: always allowed from a click.
+	local announce = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	announce:SetSize(170, 26)
+	announce:SetPoint("TOP", 0, -300)
+	announce:SetText("Announce to Group")
+	announce:SetScript("OnClick", function()
+		DB.message = msgBox:GetText()
+		Announce()
+	end)
+
+	-- Open the macro editor (same width as the announce button).
+	local macroBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	macroBtn:SetSize(170, 24)
+	macroBtn:SetPoint("TOP", 0, -334)
+	macroBtn:SetText("Edit Macro...")
+	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
+
+	local p = DB.point or DEFAULTS.point
+	frame:ClearAllPoints()
+	frame:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+
+	frame:Hide()
+	return frame
+end
+
+local function ShowUI()
+	if InCombatLockdown() then
+		print(PREFIX .. "in combat, not opening (this is an out-of-combat tool).")
+		return
+	end
+	CreateUI()
+	UpdateSelection()
+	frame.readyCB:Refresh()
+	frame.autoCB:Refresh()
+	frame.msgBox:SetText(DB.message or DEFAULTS.message)
+	UpdateManagedMacro()
+	frame:Show()
+	frame:Raise()
+	if DB.autoAnnounce then Announce() end
+end
+
+-- Global opener so ArcUI (or any addon) can open the window.
+SetMyKick_Show = ShowUI
+
+--------------------------------------------------------------------------------
+-- Macro editor UI
+--------------------------------------------------------------------------------
+
+local function MacroNoteText()
+	return "{interrupt} fills in your interrupt (now: " ..
+		(GetMyInterruptName() or "none for this spec") .. "); {kick} fills in your marker."
+end
+
+function SetMyKick_ShowMacroEditor()
+	if macroFrame then
+		macroFrame.nameBox:SetText(DB.macroName or DEFAULTS.macroName)
+		macroFrame.scroll.EditBox:SetText(DB.macroTemplate or DEFAULT_MACRO)
+		macroFrame.note:SetText(MacroNoteText())
+		macroFrame:Show()
+		macroFrame:Raise()
+		return
+	end
+
+	macroFrame = CreateFrame("Frame", "SetMyKickMacroFrame", UIParent, "BackdropTemplate")
+	macroFrame:SetSize(420, 330)
+	macroFrame:SetFrameStrata("DIALOG")
+	macroFrame:SetToplevel(true)
+	macroFrame:SetClampedToScreen(true)
+	macroFrame:SetBackdrop({
+		bgFile   = "Interface\\DialogFrame\\UI-DialogBox-Background",
+		edgeFile = "Interface\\DialogFrame\\UI-DialogBox-Border",
+		tile = true, tileSize = 32, edgeSize = 32,
+		insets = { left = 11, right = 12, top = 12, bottom = 11 },
+	})
+	macroFrame:SetMovable(true)
+	macroFrame:EnableMouse(true)
+	macroFrame:RegisterForDrag("LeftButton")
+	macroFrame:SetScript("OnDragStart", macroFrame.StartMoving)
+	macroFrame:SetScript("OnDragStop", function(self)
+		self:StopMovingOrSizing()
+		local pt, _, rp, x, y = self:GetPoint()
+		DB.macroPoint = { pt, rp, x, y }
+	end)
+	tinsert(UISpecialFrames, "SetMyKickMacroFrame")
+
+	local close = CreateFrame("Button", nil, macroFrame, "UIPanelCloseButton")
+	close:SetPoint("TOPRIGHT", -4, -4)
+
+	local title = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontNormalLarge")
+	title:SetPoint("TOP", 0, -16)
+	title:SetText("Edit Kick Macro")
+
+	local nameLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	nameLabel:SetPoint("TOPLEFT", 24, -46)
+	nameLabel:SetText("Macro name:")
+
+	local nameBox = CreateFrame("EditBox", nil, macroFrame, "InputBoxTemplate")
+	nameBox:SetSize(130, 20)
+	nameBox:SetPoint("LEFT", nameLabel, "RIGHT", 10, 0)
+	nameBox:SetAutoFocus(false)
+	nameBox:SetText(DB.macroName or DEFAULTS.macroName)
+	nameBox:SetScript("OnEscapePressed", nameBox.ClearFocus)
+	nameBox:SetScript("OnEnterPressed", nameBox.ClearFocus)
+	macroFrame.nameBox = nameBox
+
+	local note = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	note:SetPoint("TOPLEFT", 24, -72)
+	note:SetPoint("TOPRIGHT", -24, -72)
+	note:SetJustifyH("LEFT")
+	macroFrame.note = note
+	note:SetText(MacroNoteText())
+
+	local bodyLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	bodyLabel:SetPoint("TOPLEFT", 24, -100)
+	bodyLabel:SetText("Macro body (use {kick} where the marker number goes):")
+
+	local scroll = CreateFrame("ScrollFrame", "SetMyKickMacroScroll", macroFrame, "InputScrollFrameTemplate")
+	scroll:SetSize(372, 100)
+	scroll:SetPoint("TOPLEFT", 24, -120)
+	scroll.EditBox:SetMultiLine(true)
+	scroll.EditBox:SetMaxLetters(255)
+	scroll.EditBox:SetWidth(360)
+	scroll.EditBox:SetFontObject(ChatFontNormal)
+	scroll.EditBox:SetText(DB.macroTemplate or DEFAULT_MACRO)
+	if scroll.CharCount then scroll.CharCount:Hide() end
+	macroFrame.scroll = scroll
+
+	-- Frame border around the scroll for clarity.
+	local border = CreateFrame("Frame", nil, macroFrame, "BackdropTemplate")
+	border:SetPoint("TOPLEFT", scroll, "TOPLEFT", -6, 6)
+	border:SetPoint("BOTTOMRIGHT", scroll, "BOTTOMRIGHT", 22, -6)
+	border:SetBackdrop({
+		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border",
+		edgeSize = 12,
+	})
+
+	-- Pick an existing macro to manage; loads its name + body so you can add {kick}.
+	local macroDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
+	macroDrop:SetSize(150, 22)
+	macroDrop:SetPoint("LEFT", nameBox, "RIGHT", 12, 0)
+	macroDrop:SetDefaultText("Pick existing...")
+	macroDrop:SetupMenu(function(dropdown, root)
+		root:SetScrollMode(20 * 18)   -- cap at ~18 rows, scroll beyond that
+		local function AddMacro(actualIndex)
+			local mname, _, mbody = GetMacroInfo(actualIndex)
+			if mname and mname ~= "" then
+				root:CreateButton(mname, function()
+					nameBox:SetText(mname)
+					scroll.EditBox:SetText(mbody or "")
+				end)
+			end
+		end
+		local numAccount, numChar = GetNumMacros()
+		for i = 1, numAccount do AddMacro(i) end
+		for i = 1, numChar do AddMacro(MAX_ACCOUNT_MACROS + i) end
+	end)
+
+	local info = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	info:SetPoint("TOPLEFT", 24, -230)
+	info:SetPoint("TOPRIGHT", -24, -230)
+	info:SetJustifyH("LEFT")
+	info:SetText("Keep {kick} somewhere in the macro (you can move it, just don't delete it). Saving updates the macro; the marker re-syncs when you pick. Drag it to your bars.")
+
+	local saveBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
+	saveBtn:SetSize(170, 24)
+	saveBtn:SetPoint("BOTTOMLEFT", 30, 18)
+	saveBtn:SetText("Save & Update Macro")
+	saveBtn:SetScript("OnClick", function()
+		local nm = nameBox:GetText()
+		nm = (nm or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		DB.macroName     = nm ~= "" and nm or DEFAULTS.macroName
+		DB.macroTemplate = scroll.EditBox:GetText()
+		DB.macroEnabled  = true
+		nameBox:SetText(DB.macroName)
+		UpdateManagedMacro(true)
+	end)
+
+	local resetBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
+	resetBtn:SetSize(170, 24)
+	resetBtn:SetPoint("BOTTOMRIGHT", -30, 18)
+	resetBtn:SetText("Reset to Default")
+	resetBtn:SetScript("OnClick", function()
+		scroll.EditBox:SetText(DEFAULT_MACRO)
+		nameBox:SetText(DEFAULTS.macroName)
+	end)
+
+	local p = DB.macroPoint or DEFAULTS.macroPoint
+	macroFrame:ClearAllPoints()
+	macroFrame:SetPoint(p[1], UIParent, p[2], p[3], p[4])
+	macroFrame:Show()
+	macroFrame:Raise()
+end
+
+--------------------------------------------------------------------------------
+-- Minimap button + Blizzard options panel
+--------------------------------------------------------------------------------
+
+local minimapBtn
+local settingsCategory
+
+local function OpenSettings()
+	if settingsCategory then
+		Settings.OpenToCategory(settingsCategory:GetID())
+	end
+end
+
+local function UpdateMinimapShown()
+	if not minimapBtn then return end
+	if DB.minimap.hide then minimapBtn:Hide() else minimapBtn:Show() end
+end
+
+local function UpdateMinimapPos()
+	if not minimapBtn then return end
+	local angle = math.rad(DB.minimap.angle or 214)
+	local r = (Minimap:GetWidth() / 2) + 5
+	minimapBtn:ClearAllPoints()
+	minimapBtn:SetPoint("CENTER", Minimap, "CENTER", math.cos(angle) * r, math.sin(angle) * r)
+end
+
+local function CreateMinimapButton()
+	if minimapBtn then return end
+	local b = CreateFrame("Button", "SetMyKickMinimapButton", Minimap)
+	b:SetSize(31, 31)
+	b:SetFrameStrata("MEDIUM")
+	b:SetFrameLevel(8)
+	b:RegisterForClicks("LeftButtonUp", "RightButtonUp")
+	b:RegisterForDrag("LeftButton")
+
+	local bg = b:CreateTexture(nil, "BACKGROUND")
+	bg:SetSize(20, 20)
+	bg:SetTexture("Interface\\Minimap\\UI-Minimap-Background")
+	bg:SetPoint("TOPLEFT", 7, -5)
+
+	local icon = b:CreateTexture(nil, "ARTWORK")
+	icon:SetSize(18, 18)
+	icon:SetPoint("TOPLEFT", 7, -6)
+	SetMarkerTexture(icon, 8) -- skull
+
+	local overlay = b:CreateTexture(nil, "OVERLAY")
+	overlay:SetSize(53, 53)
+	overlay:SetTexture("Interface\\Minimap\\MiniMap-TrackingBorder")
+	overlay:SetPoint("TOPLEFT")
+
+	b:SetScript("OnClick", function(_, button)
+		if button == "RightButton" then OpenSettings() else ShowUI() end
+	end)
+
+	-- Drag around the minimap edge; OnUpdate only runs while dragging.
+	b:SetScript("OnDragStart", function(self)
+		self:SetScript("OnUpdate", function()
+			local mx, my = Minimap:GetCenter()
+			local scale = Minimap:GetEffectiveScale()
+			local px, py = GetCursorPosition()
+			px, py = px / scale, py / scale
+			DB.minimap.angle = math.deg(math.atan2(py - my, px - mx))
+			UpdateMinimapPos()
+		end)
+	end)
+	b:SetScript("OnDragStop", function(self) self:SetScript("OnUpdate", nil) end)
+
+	b:SetScript("OnEnter", function(self)
+		GameTooltip:SetOwner(self, "ANCHOR_LEFT")
+		GameTooltip:SetText("Set My Kick")
+		GameTooltip:AddLine("Left-click: open window", 1, 1, 1)
+		GameTooltip:AddLine("Right-click: options", 1, 1, 1)
+		GameTooltip:AddLine("Drag: move button", 1, 1, 1)
+		GameTooltip:Show()
+	end)
+	b:SetScript("OnLeave", GameTooltip_Hide)
+
+	minimapBtn = b
+	UpdateMinimapPos()
+	UpdateMinimapShown()
+end
+
+local function CreateSettingsPanel()
+	if settingsCategory then return end
+	local panel = CreateFrame("Frame", "SetMyKickSettingsPanel")
+	panel.name = "Set My Kick"
+
+	local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
+	title:SetPoint("TOPLEFT", 16, -16)
+	title:SetText("Set My Kick")
+
+	local desc = panel:CreateFontString(nil, "ARTWORK", "GameFontHighlightSmall")
+	desc:SetPoint("TOPLEFT", title, "BOTTOMLEFT", 0, -8)
+	desc:SetPoint("RIGHT", panel, "RIGHT", -16, 0)
+	desc:SetJustifyH("LEFT")
+	desc:SetText("Pick your interrupt raid marker, announce it to the group, and keep your kick macro's marker in sync.")
+
+	local openBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+	openBtn:SetSize(220, 26)
+	openBtn:SetPoint("TOPLEFT", desc, "BOTTOMLEFT", 0, -16)
+	openBtn:SetText("Open Set My Kick Window")
+	openBtn:SetScript("OnClick", function() ShowUI() end)
+
+	local macroBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+	macroBtn:SetSize(220, 26)
+	macroBtn:SetPoint("TOPLEFT", openBtn, "BOTTOMLEFT", 0, -8)
+	macroBtn:SetText("Edit Kick Macro")
+	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
+
+	local mmCB = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+	mmCB:SetPoint("TOPLEFT", macroBtn, "BOTTOMLEFT", 0, -16)
+	mmCB:SetChecked(not DB.minimap.hide)
+	mmCB:SetScript("OnClick", function(self)
+		DB.minimap.hide = not self:GetChecked()
+		UpdateMinimapShown()
+	end)
+	local mmLabel = mmCB:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	mmLabel:SetPoint("LEFT", mmCB, "RIGHT", 2, 0)
+	mmLabel:SetText("Show minimap button")
+
+	local category = Settings.RegisterCanvasLayoutCategory(panel, "Set My Kick")
+	Settings.RegisterAddOnCategory(category)
+	settingsCategory = category
+end
+
+--------------------------------------------------------------------------------
+-- Events
+--------------------------------------------------------------------------------
+
+local ev = CreateFrame("Frame")
+ev:RegisterEvent("ADDON_LOADED")
+ev:RegisterEvent("READY_CHECK")
+ev:RegisterEvent("PLAYER_REGEN_ENABLED")
+ev:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
+ev:SetScript("OnEvent", function(_, event, arg1)
+	if event == "ADDON_LOADED" then
+		if arg1 ~= ADDON then return end
+		SetMyKickDB = SetMyKickDB or {}
+		DB = SetMyKickDB
+		for k, v in pairs(DEFAULTS) do
+			if DB[k] == nil then
+				DB[k] = (type(v) == "table") and CopyTable(v) or v
+			end
+		end
+		CreateMinimapButton()
+		CreateSettingsPanel()
+		print(PREFIX .. "loaded. /smk to open.")
+	elseif event == "READY_CHECK" then
+		if DB and DB.showOnReadyCheck and InMythicDungeon() then ShowUI() end
+	elseif event == "PLAYER_REGEN_ENABLED" then
+		-- Catch up any macro edit deferred from combat.
+		UpdateManagedMacro()
+	elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
+		-- New spec may have a different interrupt; re-sync {interrupt}.
+		if arg1 == "player" then
+			UpdateManagedMacro()
+			if macroFrame and macroFrame:IsShown() then macroFrame.note:SetText(MacroNoteText()) end
+		end
+	end
+end)
+
+--------------------------------------------------------------------------------
+-- Slash
+--------------------------------------------------------------------------------
+
+SLASH_SETMYKICK1 = "/smk"
+SLASH_SETMYKICK2 = "/setmykick"
+SlashCmdList["SETMYKICK"] = function(msg)
+	msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
+	if msg == "hide" then
+		if frame then frame:Hide() end
+	elseif msg == "macro" then
+		SetMyKick_ShowMacroEditor()
+	elseif msg == "options" or msg == "config" then
+		OpenSettings()
+	elseif msg == "minimap" then
+		DB.minimap.hide = not DB.minimap.hide
+		UpdateMinimapShown()
+	elseif msg == "" or msg == "show" then
+		ShowUI()
+	else
+		print(PREFIX .. "commands: /smk (open), /smk macro, /smk options, /smk minimap, /smk hide")
+	end
+end

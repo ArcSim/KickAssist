@@ -24,11 +24,16 @@ local DEFAULT_MACRO =
 	"/focus [@focus,noexists] target\n" ..
 	"/tm [@target,noexists][@target,dead] {kick}; {kick}"
 
--- Selectable macro templates ({interrupt} = your spec's interrupt, {kick} = marker).
+-- Set-focus-only macro: every press re-focuses your current target and marks it.
+local SET_FOCUS_MACRO =
+	"#showtooltip\n" ..
+	"/focus target\n" ..
+	"/tm [@target,noexists][@target,dead] {kick}; {kick}"
+
+-- Selectable templates for the customizable Focus+Kick macro.
 local TEMPLATES = {
 	{ name = "Focus + Kick (set focus, then interrupt)", body = DEFAULT_MACRO },
-	{ name = "Set focus only (and mark)",
-	  body = "#showtooltip\n/focus target\n/tm [@target,noexists][@target,dead] {kick}; {kick}" },
+	{ name = "Set focus only (and mark)", body = SET_FOCUS_MACRO },
 	{ name = "Kick focus only (and mark)",
 	  body = "#showtooltip {interrupt}\n/cast [@focus,harm,nodead] {interrupt}\n/tm [@target,noexists][@target,dead] {kick}; {kick}" },
 }
@@ -41,8 +46,9 @@ local DEFAULTS = {
 	point                = { "CENTER", "CENTER", 0, 140 },
 
 	macroEnabled         = false,        -- opt-in: do not touch macros until the user enables it
-	macroName            = "Focus",
+	macroName            = "FocusKick",  -- set-focus-and-kick macro (customizable)
 	macroTemplate        = DEFAULT_MACRO,
+	setFocusName         = "SetFocus",   -- set-focus-and-mark macro (fixed)
 	macroPoint           = { "CENTER", "CENTER", 0, 0 },
 
 	minimap              = { angle = 214, hide = false },
@@ -179,6 +185,30 @@ local function UpdateManagedMacro(verbose)
 	end
 end
 
+-- The fixed "set focus + mark" macro. Synced if it exists; created when create=true.
+local function UpdateSetFocusMacro(create)
+	if InCombatLockdown() then return end
+	local name = DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName
+	local body = SET_FOCUS_MACRO:gsub("{kick}", tostring(DB.marker))
+	local idx = GetMacroIndexByName(name)
+	if idx and idx > 0 then
+		EditMacro(idx, name, QUESTION_ICON, body)
+	elseif create then
+		local _, numChar = GetNumMacros()
+		if numChar and numChar >= MAX_CHARACTER_MACROS then
+			print(PREFIX .. "no free character macro slots for '" .. name .. "'.")
+			return
+		end
+		CreateMacro(name, QUESTION_ICON, body, true)
+	end
+end
+
+-- Keep both macros in sync with the chosen marker; only edits ones that exist.
+local function SyncMacros(verbose)
+	UpdateManagedMacro(verbose)
+	UpdateSetFocusMacro(false)
+end
+
 --------------------------------------------------------------------------------
 -- Main popup UI
 --------------------------------------------------------------------------------
@@ -212,17 +242,29 @@ local function MakeCheck(parent, label, x, y, get, set)
 	return cb
 end
 
-local function RefreshDragIcon()
-	if not frame or not frame.dragIcon then return end
-	local id = GetMyInterruptID()
-	frame.dragIcon:SetTexture((id and C_Spell.GetSpellTexture(id)) or 134400)
+local function RefreshDragIcons()
+	if not frame then return end
+	if frame.kickIcon then
+		local id = GetMyInterruptID()
+		frame.kickIcon:SetTexture((id and C_Spell.GetSpellTexture(id)) or 134400)
+		frame.kickIcon:SetTexCoord(0, 1, 0, 1)
+	end
+	if frame.focusIcon then
+		local m = DB.marker
+		if m and m >= 1 and m <= 8 then
+			SetMarkerTexture(frame.focusIcon, m)
+		else
+			frame.focusIcon:SetTexture(134400)
+			frame.focusIcon:SetTexCoord(0, 1, 0, 1)
+		end
+	end
 end
 
 local function CreateUI()
 	if frame then return frame end
 
 	frame = CreateFrame("Frame", "SetMyKickFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(300, 440)
+	frame:SetSize(300, 452)
 	frame:SetFrameStrata("DIALOG")
 	frame:SetToplevel(true)
 	frame:SetClampedToScreen(true)
@@ -274,7 +316,8 @@ local function CreateUI()
 		btn:SetScript("OnClick", function()
 			DB.marker = i
 			UpdateSelection()
-			UpdateManagedMacro()
+			RefreshDragIcons()
+			SyncMacros()
 			Announce()
 		end)
 		btn:SetScript("OnEnter", function(self)
@@ -296,7 +339,8 @@ local function CreateUI()
 	none:SetScript("OnClick", function()
 		DB.marker = 0
 		UpdateSelection()
-		UpdateManagedMacro()
+		RefreshDragIcons()
+		SyncMacros()
 	end)
 	frame.noneButton = none
 
@@ -344,22 +388,12 @@ local function CreateUI()
 	macroBtn:SetText("Edit Macro...")
 	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
 
-	-- Drag-to-bars: pick up the managed macro so new users can drop it on a bar.
-	local dragLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	dragLabel:SetPoint("TOP", 0, -366)
-	dragLabel:SetText("New? Drag this macro to your action bar:")
+	-- Drag-to-bars: two ready macros new users can drop straight onto their bars.
+	local dragHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	dragHeader:SetPoint("TOP", 0, -360)
+	dragHeader:SetText("New? Drag a macro to your action bar:")
 
-	local dragBox = CreateFrame("Button", nil, frame)
-	dragBox:SetSize(40, 40)
-	dragBox:SetPoint("TOP", 0, -384)
-	dragBox:RegisterForDrag("LeftButton")
-	dragBox:RegisterForClicks("LeftButtonUp")
-	local dicon = dragBox:CreateTexture(nil, "ARTWORK")
-	dicon:SetAllPoints()
-	dragBox:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
-	frame.dragIcon = dicon
-
-	local function PickupTheMacro()
+	local function PickupKickMacro()
 		if InCombatLockdown() then return end
 		local name = DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
 		DB.macroEnabled = true
@@ -367,16 +401,43 @@ local function CreateUI()
 		local idx = GetMacroIndexByName(name)
 		if idx and idx > 0 then PickupMacro(idx) end
 	end
-	dragBox:SetScript("OnDragStart", PickupTheMacro)
-	dragBox:SetScript("OnClick", PickupTheMacro)
-	dragBox:SetScript("OnEnter", function(self)
-		GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
-		GameTooltip:SetText("Set My Kick macro")
-		GameTooltip:AddLine("Drag onto an action bar, or click to pick it up then click a bar slot.", 1, 1, 1, true)
-		GameTooltip:Show()
-	end)
-	dragBox:SetScript("OnLeave", GameTooltip_Hide)
-	RefreshDragIcon()
+
+	local function PickupFocusMacro()
+		if InCombatLockdown() then return end
+		local name = DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName
+		UpdateSetFocusMacro(true)
+		local idx = GetMacroIndexByName(name)
+		if idx and idx > 0 then PickupMacro(idx) end
+	end
+
+	local function MakeDragBox(xOff, labelText, pickup, isFocus)
+		local box = CreateFrame("Button", nil, frame)
+		box:SetSize(40, 40)
+		box:SetPoint("TOP", xOff, -378)
+		box:RegisterForDrag("LeftButton")
+		box:RegisterForClicks("LeftButtonUp")
+		local ic = box:CreateTexture(nil, "ARTWORK")
+		ic:SetAllPoints()
+		box:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
+		if isFocus then frame.focusIcon = ic else frame.kickIcon = ic end
+		box:SetScript("OnDragStart", pickup)
+		box:SetScript("OnClick", pickup)
+		box:SetScript("OnEnter", function(self)
+			GameTooltip:SetOwner(self, "ANCHOR_RIGHT")
+			GameTooltip:SetText(labelText)
+			GameTooltip:AddLine("Drag onto an action bar, or click then click a bar slot.", 1, 1, 1, true)
+			GameTooltip:Show()
+		end)
+		box:SetScript("OnLeave", GameTooltip_Hide)
+		local lbl = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+		lbl:SetPoint("TOP", box, "BOTTOM", 0, -4)
+		lbl:SetText(labelText)
+		return box
+	end
+
+	MakeDragBox(-55, "Focus + Kick", PickupKickMacro, false)
+	MakeDragBox(55, "Set Focus", PickupFocusMacro, true)
+	RefreshDragIcons()
 
 	local p = DB.point or DEFAULTS.point
 	frame:ClearAllPoints()
@@ -396,8 +457,8 @@ local function ShowUI()
 	frame.readyCB:Refresh()
 	frame.autoCB:Refresh()
 	frame.msgBox:SetText(DB.message or DEFAULTS.message)
-	RefreshDragIcon()
-	UpdateManagedMacro()
+	RefreshDragIcons()
+	SyncMacros()
 	frame:Show()
 	frame:Raise()
 	if DB.autoAnnounce then Announce() end
@@ -715,12 +776,12 @@ ev:SetScript("OnEvent", function(_, event, arg1)
 	elseif event == "READY_CHECK" then
 		if DB and DB.showOnReadyCheck and InMythicDungeon() then ShowUI() end
 	elseif event == "PLAYER_REGEN_ENABLED" then
-		-- Catch up any macro edit deferred from combat.
-		UpdateManagedMacro()
+		-- Catch up any macro edits deferred from combat.
+		SyncMacros()
 	elseif event == "PLAYER_SPECIALIZATION_CHANGED" then
-		-- New spec may have a different interrupt; re-sync {interrupt}.
+		-- New spec may have a different interrupt; re-sync both macros.
 		if arg1 == "player" then
-			UpdateManagedMacro()
+			SyncMacros()
 			if macroFrame and macroFrame:IsShown() then macroFrame.note:SetText(MacroNoteText()) end
 		end
 	end

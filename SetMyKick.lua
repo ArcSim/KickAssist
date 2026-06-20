@@ -548,6 +548,12 @@ function SetMyKick_ShowMacroEditor()
 			local body = t.body
 			root:CreateButton(t.name, function()
 				scroll.EditBox:SetText(body)
+				local nm = (nameBox:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+				DB.macroName     = nm ~= "" and nm or DEFAULTS.macroName
+				DB.macroTemplate = body
+				DB.macroEnabled  = true
+				nameBox:SetText(DB.macroName)
+				UpdateManagedMacro(true)
 			end)
 		end
 	end)

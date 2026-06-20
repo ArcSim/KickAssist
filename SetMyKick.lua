@@ -72,7 +72,7 @@ local MARKER_NAMES = {
 
 local PREFIX = "|cff33ff99Set My Focus Kick|r: "
 local QUESTION_ICON = "INV_Misc_QuestionMark"
-local FOCUS_ICON = "Ability_Hunter_AimedShot"  -- targeting crosshair for the set-focus macro
+local FOCUS_ICON = 132212  -- set-focus macro icon (fileID)
 
 local DB           -- resolved at ADDON_LOADED
 local frame        -- main popup, created lazily

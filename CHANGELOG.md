@@ -6,7 +6,7 @@
 - **Two Ready Macros**: Two draggable macro boxes in the window, one that sets focus and interrupts, and one that just sets focus and marks. Drop either straight onto your bars, no digging through the macro list.
 - **Auto Macro Sync**: Both macros stay pointed at your chosen marker automatically, and they never remove or overwrite a mark already on the target when you press them again.
 - **Per-Spec Interrupt**: The kick macro fills in the correct interrupt for your class and spec (Wind Shear, Counterspell, Mind Freeze, Counter Shot, Muzzle, and the rest) and updates when you change spec.
-- **Macro Templates**: Pick which of your two macros to edit, then load a ready-made template: focus kick (with or without a Ctrl-to-snipe modifier), press-to-focus-then-kick, mouseover kick, set focus, or mouseover set focus. Hold Ctrl to kick your current target instead of your focus.
+- **Macro Templates**: Each macro has its own template list in the editor. The kick macro offers the default (set focus, re-press to kick), a Ctrl-to-snipe-your-target version, and a mouseover version; the set-focus macro offers target or mouseover, with a targeting-crosshair icon. Hold Ctrl to kick your current target instead of your focus.
 - **Ready Check Popup**: The picker opens automatically on a ready check while you are in a Mythic+ dungeon, so you can set your marker before the pull.
 - **Macro Picker**: Point the addon at any of your existing macros from a scrollable list and it keeps the marker in sync.
 - **Minimap Button and Options Panel**: Open everything from a minimap button or the in-game AddOns options page.

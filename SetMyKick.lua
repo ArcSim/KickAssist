@@ -18,36 +18,34 @@ local ADDON = ...
 --------------------------------------------------------------------------------
 
 -- {interrupt} = your spec's interrupt, {kick} = your marker. The ~ before {kick}
--- tells the game's /tm to mark only if the target has no marker yet, so re-pressing
--- never removes or overwrites a mark. [nomod:ctrl,...] casts at your focus normally,
--- or at your current target while holding Ctrl (to snipe something off-focus).
+-- marks only if the target has no marker yet, so re-pressing never removes/overwrites
+-- a mark. The default Focus+Kick casts before setting focus, so the first press sets
+-- focus and the next press kicks it (no modifier, no mouseover).
 local DEFAULT_MACRO =
 	"#showtooltip {interrupt}\n" ..
+	"/cast [@focus,harm,nodead] {interrupt}\n" ..
 	"/focus [@focus,noexists] target\n" ..
-	"/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n" ..
 	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
 
--- Set focus + mark only; every press re-focuses your current target.
+-- Set focus + mark; no #showtooltip so it keeps the targeting icon.
 local SET_FOCUS_MACRO =
-	"#showtooltip\n" ..
 	"/focus target\n" ..
 	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
 
--- Templates you can load into either macro from the editor. All mark with ~{kick}
--- so re-pressing never removes your own mark.
+-- Templates per macro slot: the editor shows the set for whichever macro is selected.
 local TEMPLATES = {
-	{ name = "Focus + Kick (Ctrl to snipe)", body = DEFAULT_MACRO },
-	{ name = "Focus + Kick (no modifier)",
-	  body = "#showtooltip {interrupt}\n/focus [@focus,noexists] target\n/cast [@focus,harm,nodead][] {interrupt}\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
-	{ name = "Focus + Kick (press to focus, again to kick)",
-	  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
-	{ name = "Mouseover Kick (Ctrl to snipe)",
-	  body = "#showtooltip {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/tm [@mouseover,exists][] ~{kick}" },
-	{ name = "Set focus + mark (target)", body = SET_FOCUS_MACRO },
-	{ name = "Set focus + mark (mouseover)",
-	  body = "#showtooltip\n/focus [@mouseover,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
-	{ name = "Kick focus only (and mark)",
-	  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+	kick = {
+		{ name = "Focus + Kick (default, re-press to kick)", body = DEFAULT_MACRO },
+		{ name = "Focus + Kick (Ctrl to kick your target)",
+		  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+		{ name = "Mouseover Kick",
+		  body = "#showtooltip {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/cast [@focus,harm,nodead] {interrupt}\n/tm [@mouseover,exists][] ~{kick}" },
+	},
+	focus = {
+		{ name = "Set focus (target)", body = SET_FOCUS_MACRO },
+		{ name = "Set focus (mouseover)",
+		  body = "/focus [@mouseover,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
+	},
 }
 
 local DEFAULTS = {
@@ -74,6 +72,7 @@ local MARKER_NAMES = {
 
 local PREFIX = "|cff33ff99Set My Focus Kick|r: "
 local QUESTION_ICON = "INV_Misc_QuestionMark"
+local FOCUS_ICON = "Ability_Hunter_AimedShot"  -- targeting crosshair for the set-focus macro
 
 local DB           -- resolved at ADDON_LOADED
 local frame        -- main popup, created lazily
@@ -209,7 +208,7 @@ local function UpdateSetFocusMacro(create, verbose)
 	local body = tostring(DB.setFocusTemplate or SET_FOCUS_MACRO):gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
 	local idx = GetMacroIndexByName(name)
 	if idx and idx > 0 then
-		EditMacro(idx, name, QUESTION_ICON, body)
+		EditMacro(idx, name, FOCUS_ICON, body)
 		if verbose then print(PREFIX .. "updated macro '" .. name .. "'.") end
 	elseif create then
 		local _, numChar = GetNumMacros()
@@ -217,7 +216,7 @@ local function UpdateSetFocusMacro(create, verbose)
 			print(PREFIX .. "no free character macro slots for '" .. name .. "'.")
 			return
 		end
-		CreateMacro(name, QUESTION_ICON, body, true)
+		CreateMacro(name, FOCUS_ICON, body, true)
 		if verbose then print(PREFIX .. "created macro '" .. name .. "'. Drag it to your bars.") end
 	end
 end
@@ -266,16 +265,11 @@ local function RefreshDragIcons()
 	if frame.kickIcon then
 		local id = GetMyInterruptID()
 		frame.kickIcon:SetTexture((id and C_Spell.GetSpellTexture(id)) or 134400)
-		frame.kickIcon:SetTexCoord(0, 1, 0, 1)
+		frame.kickIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 	end
 	if frame.focusIcon then
-		local m = DB.marker
-		if m and m >= 1 and m <= 8 then
-			SetMarkerTexture(frame.focusIcon, m)
-		else
-			frame.focusIcon:SetTexture(134400)
-			frame.focusIcon:SetTexCoord(0, 1, 0, 1)
-		end
+		frame.focusIcon:SetTexture("Interface\\Icons\\" .. FOCUS_ICON)
+		frame.focusIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 	end
 end
 
@@ -663,7 +657,7 @@ function SetMyKick_ShowMacroEditor()
 	templateDrop:SetDefaultText("Choose a template...")
 	templateDrop:SetupMenu(function(dropdown, root)
 		root:SetScrollMode(20 * 16)
-		for _, t in ipairs(TEMPLATES) do
+		for _, t in ipairs(TEMPLATES[editorSlot] or {}) do
 			local body = t.body
 			root:CreateButton(t.name, function()
 				scroll.EditBox:SetText(body)

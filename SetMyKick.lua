@@ -32,21 +32,44 @@ local SET_FOCUS_MACRO =
 	"/focus target\n" ..
 	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
 
+-- Auto tab kick: kicks your focus if you have one, else tab-interrupts a casting
+-- mob in front of you without losing your current target.
+local AUTOTAB_MACRO =
+	"#showtooltip {interrupt}\n" ..
+	"/cast [@focus,exists,nodead,harm] {interrupt}\n" ..
+	"/stopmacro [@focus,exists,nodead,harm]\n" ..
+	"/focus target\n" ..
+	"/cleartarget\n" ..
+	"/targetenemy\n" ..
+	"/cast {interrupt}\n" ..
+	"/target focus\n" ..
+	"/clearfocus\n" ..
+	"/startattack"
+
 -- Templates per macro slot: the editor shows the set for whichever macro is selected.
 local TEMPLATES = {
 	kick = {
 		{ name = "Focus + Kick (default, re-press to kick)", body = DEFAULT_MACRO },
 		{ name = "Focus + Kick (Ctrl to kick your target)",
 		  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
-		{ name = "Auto Tab Kick (keeps your target)",
-		  body = "#showtooltip {interrupt}\n/cast [@focus,exists,nodead,harm] {interrupt}\n/stopmacro [@focus,exists,nodead,harm]\n/focus target\n/cleartarget\n/targetenemy\n/cast {interrupt}\n/target focus\n/clearfocus\n/startattack" },
 	},
 	focus = {
 		{ name = "Set focus (target)", body = SET_FOCUS_MACRO },
 		{ name = "Set focus (mouseover)",
 		  body = "/focus [@mouseover,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
 	},
+	autotab = {
+		{ name = "Auto Tab Kick (keeps your target)", body = AUTOTAB_MACRO },
+	},
 }
+
+-- The three macro slots the editor can edit (Focus+Kick, Set Focus, Auto Tab Kick).
+local SLOT_CFG = {
+	kick    = { label = "Focus + Kick",  nameKey = "macroName",    tmplKey = "macroTemplate",    defName = "FocusKick",   defBody = DEFAULT_MACRO },
+	focus   = { label = "Set Focus",     nameKey = "setFocusName", tmplKey = "setFocusTemplate", defName = "SetFocus",    defBody = SET_FOCUS_MACRO },
+	autotab = { label = "Auto Tab Kick", nameKey = "autoTabName",  tmplKey = "autoTabTemplate",  defName = "AutoTabKick", defBody = AUTOTAB_MACRO },
+}
+local SLOT_ORDER = { "kick", "focus", "autotab" }
 
 local DEFAULTS = {
 	marker               = 8,            -- 1..8 raid target index, 0 = no marker (skull default)
@@ -60,6 +83,8 @@ local DEFAULTS = {
 	macroTemplate        = DEFAULT_MACRO,
 	setFocusName         = "SetFocus",   -- set-focus-and-mark macro
 	setFocusTemplate     = SET_FOCUS_MACRO,
+	autoTabName          = "AutoTabKick",-- auto tab-interrupt macro
+	autoTabTemplate      = AUTOTAB_MACRO,
 	macroPoint           = { "CENTER", "CENTER", 0, 0 },
 
 	minimap              = { angle = 214, hide = false },
@@ -211,10 +236,30 @@ local function UpdateSetFocusMacro(create)
 	end
 end
 
--- Keep both macros in sync with the chosen marker; only edits ones that exist.
-local function SyncMacros(verbose)
-	UpdateManagedMacro(verbose)
+-- The auto-tab-interrupt macro. Synced if it exists; created when create=true.
+local function UpdateAutoTabMacro(create)
+	if InCombatLockdown() then return end
+	local name = DB.autoTabName ~= "" and DB.autoTabName or DEFAULTS.autoTabName
+	local interrupt = GetMyInterruptName() or ""
+	local body = tostring(DB.autoTabTemplate or AUTOTAB_MACRO):gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
+	local idx = GetMacroIndexByName(name)
+	if idx and idx > 0 then
+		EditMacro(idx, name, QUESTION_ICON, body)
+	elseif create then
+		local _, numChar = GetNumMacros()
+		if numChar and numChar >= MAX_CHARACTER_MACROS then
+			print(PREFIX .. "no free character macro slots for '" .. name .. "'.")
+			return
+		end
+		CreateMacro(name, QUESTION_ICON, body, true)
+	end
+end
+
+-- Keep all managed macros in sync with the chosen marker; only edits ones that exist.
+local function SyncMacros()
+	UpdateManagedMacro()
 	UpdateSetFocusMacro(false)
+	UpdateAutoTabMacro(false)
 end
 
 --------------------------------------------------------------------------------
@@ -251,19 +296,24 @@ local function MakeCheck(parent, label, x, y, get, set)
 end
 
 local function RefreshDragIcons()
-	if not frame then return end
-	if frame.kickIcon then
-		local id = GetMyInterruptID()
-		frame.kickIcon:SetTexture((id and C_Spell.GetSpellTexture(id)) or 134400)
-		frame.kickIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+	if not frame or not frame.dragIcons then return end
+	local id = GetMyInterruptID()
+	local spellTex = (id and C_Spell.GetSpellTexture(id)) or 134400
+	if frame.dragIcons.kick then
+		frame.dragIcons.kick:SetTexture(spellTex)
+		frame.dragIcons.kick:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 	end
-	if frame.focusIcon then
+	if frame.dragIcons.autotab then
+		frame.dragIcons.autotab:SetTexture(spellTex)
+		frame.dragIcons.autotab:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+	end
+	if frame.dragIcons.focus then
 		if type(FOCUS_ICON) == "number" then
-			frame.focusIcon:SetTexture(FOCUS_ICON)
+			frame.dragIcons.focus:SetTexture(FOCUS_ICON)
 		else
-			frame.focusIcon:SetTexture("Interface\\Icons\\" .. FOCUS_ICON)
+			frame.dragIcons.focus:SetTexture("Interface\\Icons\\" .. FOCUS_ICON)
 		end
-		frame.focusIcon:SetTexCoord(0.08, 0.92, 0.08, 0.92)
+		frame.dragIcons.focus:SetTexCoord(0.08, 0.92, 0.08, 0.92)
 	end
 end
 
@@ -400,24 +450,17 @@ local function CreateUI()
 	dragHeader:SetPoint("TOP", 0, -360)
 	dragHeader:SetText("New? Drag a macro to your action bar:")
 
-	local function PickupKickMacro()
+	frame.dragIcons = {}
+
+	local function PickupSlot(nameKey, defName, updateFn)
 		if InCombatLockdown() then return end
-		local name = DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
-		DB.macroEnabled = true
-		UpdateManagedMacro()
+		local name = (DB[nameKey] and DB[nameKey] ~= "") and DB[nameKey] or defName
+		updateFn(true)
 		local idx = GetMacroIndexByName(name)
 		if idx and idx > 0 then PickupMacro(idx) end
 	end
 
-	local function PickupFocusMacro()
-		if InCombatLockdown() then return end
-		local name = DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName
-		UpdateSetFocusMacro(true)
-		local idx = GetMacroIndexByName(name)
-		if idx and idx > 0 then PickupMacro(idx) end
-	end
-
-	local function MakeDragBox(xOff, labelText, pickup, isFocus)
+	local function MakeDragBox(xOff, labelText, key, pickup)
 		local box = CreateFrame("Button", nil, frame)
 		box:SetSize(40, 40)
 		box:SetPoint("TOP", xOff, -378)
@@ -426,7 +469,7 @@ local function CreateUI()
 		local ic = box:CreateTexture(nil, "ARTWORK")
 		ic:SetAllPoints()
 		box:SetHighlightTexture("Interface\\Buttons\\ButtonHilight-Square", "ADD")
-		if isFocus then frame.focusIcon = ic else frame.kickIcon = ic end
+		frame.dragIcons[key] = ic
 		box:SetScript("OnDragStart", pickup)
 		box:SetScript("OnClick", pickup)
 		box:SetScript("OnEnter", function(self)
@@ -442,8 +485,16 @@ local function CreateUI()
 		return box
 	end
 
-	MakeDragBox(-55, "Focus + Kick", PickupKickMacro, false)
-	MakeDragBox(55, "Set Focus", PickupFocusMacro, true)
+	MakeDragBox(-78, "Focus + Kick", "kick", function()
+		DB.macroEnabled = true
+		PickupSlot("macroName", DEFAULTS.macroName, UpdateManagedMacro)
+	end)
+	MakeDragBox(0, "Set Focus", "focus", function()
+		PickupSlot("setFocusName", DEFAULTS.setFocusName, UpdateSetFocusMacro)
+	end)
+	MakeDragBox(78, "Tab Kick", "autotab", function()
+		PickupSlot("autoTabName", DEFAULTS.autoTabName, UpdateAutoTabMacro)
+	end)
 	RefreshDragIcons()
 
 	local p = DB.point or DEFAULTS.point
@@ -567,27 +618,29 @@ function SetMyKick_ShowMacroEditor()
 
 	-- Which macro this editor is editing.
 	local function CurrentName()
-		if editorSlot == "focus" then return DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName end
-		return DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
+		local cfg = SLOT_CFG[editorSlot]
+		local n = DB[cfg.nameKey]
+		return (n and n ~= "") and n or cfg.defName
 	end
 	local function CurrentTemplate()
-		if editorSlot == "focus" then return DB.setFocusTemplate or SET_FOCUS_MACRO end
-		return DB.macroTemplate or DEFAULT_MACRO
+		local cfg = SLOT_CFG[editorSlot]
+		return DB[cfg.tmplKey] or cfg.defBody
 	end
 	local function ReloadFields()
 		nameBox:SetText(CurrentName())
 		scroll.EditBox:SetText(CurrentTemplate())
 	end
 	local function ApplySlot(name, template)
-		if editorSlot == "focus" then
-			DB.setFocusName = name
-			DB.setFocusTemplate = template
-			UpdateSetFocusMacro(true, true)
-		else
-			DB.macroName = name
-			DB.macroTemplate = template
+		local cfg = SLOT_CFG[editorSlot]
+		DB[cfg.nameKey] = name
+		DB[cfg.tmplKey] = template
+		if editorSlot == "kick" then
 			DB.macroEnabled = true
-			UpdateManagedMacro(true)
+			UpdateManagedMacro()
+		elseif editorSlot == "focus" then
+			UpdateSetFocusMacro(true)
+		else
+			UpdateAutoTabMacro(true)
 		end
 	end
 	macroFrame.ReloadFields = ReloadFields
@@ -597,13 +650,15 @@ function SetMyKick_ShowMacroEditor()
 	editLabel:SetPoint("TOPLEFT", 24, -50)
 	editLabel:SetText("Editing:")
 
-	local function SlotText() return (editorSlot == "focus") and "Set Focus" or "Focus + Kick" end
+	local function SlotText() return SLOT_CFG[editorSlot].label end
 	local slotDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
 	slotDrop:SetSize(160, 22)
 	slotDrop:SetPoint("LEFT", editLabel, "RIGHT", 10, 0)
 	slotDrop:SetupMenu(function(dropdown, root)
-		root:CreateButton("Focus + Kick", function() editorSlot = "kick"; ReloadFields(); slotDrop:SetText(SlotText()) end)
-		root:CreateButton("Set Focus", function() editorSlot = "focus"; ReloadFields(); slotDrop:SetText(SlotText()) end)
+		for _, key in ipairs(SLOT_ORDER) do
+			local sk = key
+			root:CreateButton(SLOT_CFG[sk].label, function() editorSlot = sk; ReloadFields(); slotDrop:SetText(SlotText()) end)
+		end
 	end)
 	slotDrop:SetText(SlotText())
 

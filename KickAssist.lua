@@ -99,8 +99,11 @@ local SLOT_ORDER = { "kick", "focus", "autotab" }
 local DEFAULTS = {
 	marker               = 8,            -- 1..8 raid target index, 0 = no marker (skull default)
 	showOnReadyCheck     = true,         -- show on ready check while in a Mythic+ dungeon
+	announceOnReadyCheck = true,         -- post your kick to chat on a ready check (sends before a key; auto-skips once chat is locked)
+	-- Which instances the ready-check popup/announce fires in (default: Mythic dungeons only).
+	contexts             = { mplus = true, mythic = true, heroic = false, normal = false, raid = false },
 	autoAnnounce         = false,        -- announce automatically when the popup opens (off: click to announce)
-	message              = "Kicking %MARKER%",
+	message              = "My Focus Kick is %MARKER%",
 	point                = { "CENTER", "CENTER", 0, 140 },
 
 	macroEnabled         = false,        -- opt-in: do not touch macros until the user enables it
@@ -127,6 +130,7 @@ local FOCUS_ICON = 132212  -- set-focus macro icon (fileID)
 local DB           -- resolved at ADDON_LOADED
 local frame        -- main popup, created lazily
 local macroFrame   -- macro editor, created lazily
+local settingsCategory  -- Blizzard settings category (set in CreateSettingsPanel)
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -158,13 +162,57 @@ local function GroupChannel()
 	return nil
 end
 
--- True when in a Mythic+ / Mythic 5-player dungeon (covers both pre-key staging
--- and an active key). Difficulty 8 = Mythic Keystone, 23 = Mythic (DifficultyUtil).
-local function InMythicDungeon()
+-- Trigger contexts the popup/announce can fire in. Difficulty IDs (DifficultyUtil):
+-- 1 Normal, 2 Heroic, 23 Mythic, 8 Mythic Keystone (M+); raids via instanceType.
+local CONTEXT_DEFAULTS = { mplus = true, mythic = true, heroic = false, normal = false, raid = false }
+local CONTEXT_ORDER    = { "mplus", "mythic", "heroic", "normal", "raid" }
+local CONTEXT_LABELS   = {
+	mplus  = "Mythic+ (keystone)",
+	mythic = "Mythic dungeon",
+	heroic = "Heroic dungeon",
+	normal = "Normal dungeon",
+	raid   = "Raids",
+}
+
+-- Which trigger context (if any) the player is currently in.
+local function CurrentContextKey()
 	local inInstance, instanceType = IsInInstance()
-	if not inInstance or instanceType ~= "party" then return false end
-	local difficultyID = select(3, GetInstanceInfo())
-	return difficultyID == 8 or difficultyID == 23
+	if not inInstance then return nil end
+	if instanceType == "raid" then return "raid" end
+	if instanceType == "party" then
+		local diff = select(3, GetInstanceInfo())
+		if diff == 8  then return "mplus"  end
+		if diff == 23 then return "mythic" end
+		if diff == 2  then return "heroic" end
+		if diff == 1  then return "normal" end
+	end
+	return nil
+end
+
+-- Is this context enabled? Falls back to the default when the player hasn't set it.
+local function ContextEnabled(key)
+	local v = DB.contexts and DB.contexts[key]
+	if v == nil then v = CONTEXT_DEFAULTS[key] end
+	return v and true or false
+end
+
+-- True when the current instance is one the player enabled for the popup/announce.
+local function ShouldTriggerHere()
+	local key = CurrentContextKey()
+	return key ~= nil and ContextEnabled(key)
+end
+
+-- True when addons may post to chat right now. The Chat restriction
+-- (Enum.AddOnRestrictionType.Chat) is OFF before a Mythic+ key starts and flips
+-- ON once the key is active, where an addon SendChatMessage is blocked. Checking
+-- it lets the ready-check announce go out before the key and stand down after it,
+-- with no blocked-action error. C_RestrictedActions is 12.0+; guarded for safety.
+local function ChatAllowed()
+	local C = C_RestrictedActions
+	if C and C.IsAddOnRestrictionActive and Enum and Enum.AddOnRestrictionType then
+		return not C.IsAddOnRestrictionActive(Enum.AddOnRestrictionType.Chat)
+	end
+	return true
 end
 
 -- Interrupt ("kick") spell per class, with spec overrides keyed by specialization
@@ -200,22 +248,75 @@ local function GetMyInterruptName()
 	return id and C_Spell.GetSpellName(id) or nil
 end
 
--- Post the kick marker to group chat. Safe to call from a button OnClick (always
--- allowed) and from the trigger (allowed outside instanced content).
-local function Announce()
+-- Post the kick marker to group chat. `fromTrigger` = fired by an event (e.g. the
+-- ready check) rather than a click; on a trigger we stay silent when we can't send.
+-- We never send while chat is locked (an active Mythic+ key), so this never throws
+-- a blocked-action error -- whether called from a click or the ready-check trigger.
+local function Announce(fromTrigger)
 	local token   = ChatToken(DB.marker)
 	local msg     = (tostring(DB.message or DEFAULTS.message):gsub("%%MARKER%%", token))
 	local channel = GroupChannel()
-	if channel then
-		SendChatMessage(msg, channel)
-	else
-		print(PREFIX .. msg .. " (not in a group, shown locally)")
+	if not channel then
+		if not fromTrigger then print(PREFIX .. msg .. " (not in a group, shown locally)") end
+		return
 	end
+	if not ChatAllowed() then
+		if not fromTrigger then print(PREFIX .. "chat is locked right now (Mythic+ in progress); announce skipped.") end
+		return
+	end
+	SendChatMessage(msg, channel)
 end
 
 --------------------------------------------------------------------------------
 -- Macro management (text only; the built-in /tm does the marking)
 --------------------------------------------------------------------------------
+
+-- Swap marker numbers (0-8) that are real /tm arguments for a replacement, while
+-- leaving any digits inside [condition] brackets alone. Returns the new string and
+-- the number of markers replaced.
+local function ReplaceTmMarkers(s, replacement)
+	local out, depth, count = {}, 0, 0
+	for i = 1, #s do
+		local c = s:sub(i, i)
+		if c == "[" then
+			depth = depth + 1; out[#out + 1] = c
+		elseif c == "]" then
+			if depth > 0 then depth = depth - 1 end
+			out[#out + 1] = c
+		elseif depth == 0 and c >= "0" and c <= "8" then
+			out[#out + 1] = replacement; count = count + 1
+		else
+			out[#out + 1] = c
+		end
+	end
+	return table.concat(out), count
+end
+
+-- Make an existing macro body marker-managed for the "pick existing macro" flow:
+-- in its first /tm line swap the marker number(s) for {kick} (adding ~{kick} if that
+-- line has no number yet); if there is no /tm line at all, append one. Everything
+-- else in the macro is left exactly as the player wrote it.
+local function ManageMarkerInBody(body)
+	body = tostring(body or ""):gsub("[\r\n]+$", "")
+	if body == "" then return "/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" end
+	local lines, handled = {}, false
+	for line in (body .. "\n"):gmatch("(.-)\n") do
+		if not handled then
+			local prefix, rest = line:match("^(%s*/[tT][mM])(.*)$")
+			if prefix and (rest == "" or rest:match("^[%s%[~!0-8]")) then
+				local newRest, n = ReplaceTmMarkers(rest, "{kick}")
+				line = prefix .. newRest
+				if n == 0 then line = line .. " ~{kick}" end
+				handled = true
+			end
+		end
+		lines[#lines + 1] = line
+	end
+	if not handled then
+		lines[#lines + 1] = "/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
+	end
+	return table.concat(lines, "\n")
+end
 
 -- Rewrite the managed macro so {kick} matches the chosen marker. Out of combat
 -- only (EditMacro / CreateMacro are blocked in combat).
@@ -345,8 +446,8 @@ end
 local function CreateUI()
 	if frame then return frame end
 
-	frame = CreateFrame("Frame", "SetMyKickFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(300, 452)
+	frame = CreateFrame("Frame", "KickAssistFrame", UIParent, "BackdropTemplate")
+	frame:SetSize(300, 476)
 	frame:SetFrameStrata("DIALOG")
 	frame:SetToplevel(true)
 	frame:SetClampedToScreen(true)
@@ -368,7 +469,7 @@ local function CreateUI()
 		DB.point = { p, rp, x, y }
 	end)
 
-	tinsert(UISpecialFrames, "SetMyKickFrame")
+	tinsert(UISpecialFrames, "KickAssistFrame")
 
 	local close = CreateFrame("Button", nil, frame, "UIPanelCloseButton")
 	close:SetPoint("TOPRIGHT", -4, -4)
@@ -428,7 +529,7 @@ local function CreateUI()
 	frame.noneButton = none
 
 	-- Toggles.
-	frame.readyCB = MakeCheck(frame, "Show on ready check (in Mythic+)", 22, -196,
+	frame.readyCB = MakeCheck(frame, "Show on ready check", 22, -196,
 		function() return DB.showOnReadyCheck end,
 		function(v) DB.showOnReadyCheck = v end)
 
@@ -436,14 +537,18 @@ local function CreateUI()
 		function() return DB.autoAnnounce end,
 		function(v) DB.autoAnnounce = v end)
 
+	frame.announceCB = MakeCheck(frame, "Announce on ready check", 22, -244,
+		function() return DB.announceOnReadyCheck end,
+		function(v) DB.announceOnReadyCheck = v end)
+
 	-- Editable announce message. %MARKER% is replaced with your marker icon.
 	local msgLabel = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	msgLabel:SetPoint("TOPLEFT", 22, -250)
+	msgLabel:SetPoint("TOPLEFT", 22, -274)
 	msgLabel:SetText("Message (%MARKER% = your icon):")
 
 	local msgBox = CreateFrame("EditBox", nil, frame, "InputBoxTemplate")
 	msgBox:SetSize(246, 20)
-	msgBox:SetPoint("TOPLEFT", 28, -268)
+	msgBox:SetPoint("TOPLEFT", 28, -292)
 	msgBox:SetAutoFocus(false)
 	msgBox:SetText(DB.message or DEFAULTS.message)
 	msgBox:SetScript("OnEscapePressed", msgBox.ClearFocus)
@@ -457,23 +562,32 @@ local function CreateUI()
 	-- Announce: always allowed from a click.
 	local announce = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
 	announce:SetSize(170, 26)
-	announce:SetPoint("TOP", 0, -300)
+	announce:SetPoint("TOP", 0, -324)
 	announce:SetText("Announce to Group")
 	announce:SetScript("OnClick", function()
 		DB.message = msgBox:GetText()
 		Announce()
 	end)
 
-	-- Open the macro editor (same width as the announce button).
+	-- Edit Macro + Options sit side by side on one row.
 	local macroBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
-	macroBtn:SetSize(170, 24)
-	macroBtn:SetPoint("TOP", 0, -334)
+	macroBtn:SetSize(140, 24)
+	macroBtn:SetPoint("TOP", -73, -358)
 	macroBtn:SetText("Edit Macro...")
-	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
+	macroBtn:SetScript("OnClick", function() KickAssist_ShowMacroEditor() end)
+
+	-- Opens the Blizzard options page (instance filter for when to open/announce, minimap).
+	local optionsBtn = CreateFrame("Button", nil, frame, "UIPanelButtonTemplate")
+	optionsBtn:SetSize(140, 24)
+	optionsBtn:SetPoint("TOP", 73, -358)
+	optionsBtn:SetText("Options...")
+	optionsBtn:SetScript("OnClick", function()
+		if settingsCategory then Settings.OpenToCategory(settingsCategory:GetID()) end
+	end)
 
 	-- Drag-to-bars: two ready macros new users can drop straight onto their bars.
 	local dragHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
-	dragHeader:SetPoint("TOP", 0, -360)
+	dragHeader:SetPoint("TOP", 0, -384)
 	dragHeader:SetText("New? Drag a macro to your action bar:")
 
 	frame.dragIcons = {}
@@ -489,7 +603,7 @@ local function CreateUI()
 	local function MakeDragBox(xOff, labelText, desc, key, pickup)
 		local box = CreateFrame("Button", nil, frame, "BackdropTemplate")
 		box:SetSize(40, 40)
-		box:SetPoint("TOP", xOff, -378)
+		box:SetPoint("TOP", xOff, -402)
 		box:RegisterForDrag("LeftButton")
 		box:RegisterForClicks("LeftButtonUp")
 		box:SetBackdrop({ edgeFile = "Interface\\Buttons\\WHITE8X8", edgeSize = 2 })
@@ -545,19 +659,20 @@ local function ShowUI(fromEvent)
 	UpdateSelection()
 	frame.readyCB:Refresh()
 	frame.autoCB:Refresh()
+	frame.announceCB:Refresh()
 	frame.msgBox:SetText(DB.message or DEFAULTS.message)
 	RefreshDragIcons()
 	SyncMacros()
 	frame:Show()
 	frame:Raise()
-	-- Auto-announce only when YOU opened it (a click or /smk). On a trigger like the
+	-- Auto-announce only when YOU opened it (a click or /ka). On a trigger like the
 	-- ready check (fromEvent), skip it: an automated SendChatMessage inside an instance
 	-- is blocked. Your marker/Announce clicks are hardware events and always send.
 	if DB.autoAnnounce and not fromEvent then Announce() end
 end
 
 -- Global opener so ArcUI (or any addon) can open the window.
-SetMyKick_Show = ShowUI
+KickAssist_Show = ShowUI
 
 --------------------------------------------------------------------------------
 -- Macro editor UI
@@ -570,7 +685,7 @@ local function MacroNoteText()
 		(GetMyInterruptName() or "none for this spec") .. "); {kick} fills in your marker."
 end
 
-function SetMyKick_ShowMacroEditor()
+function KickAssist_ShowMacroEditor()
 	if macroFrame then
 		macroFrame.note:SetText(MacroNoteText())
 		macroFrame:Show()
@@ -579,8 +694,8 @@ function SetMyKick_ShowMacroEditor()
 		return
 	end
 
-	macroFrame = CreateFrame("Frame", "SetMyKickMacroFrame", UIParent, "BackdropTemplate")
-	macroFrame:SetSize(420, 380)
+	macroFrame = CreateFrame("Frame", "KickAssistMacroFrame", UIParent, "BackdropTemplate")
+	macroFrame:SetSize(420, 416)
 	macroFrame:SetFrameStrata("DIALOG")
 	macroFrame:SetToplevel(true)
 	macroFrame:SetClampedToScreen(true)
@@ -600,7 +715,7 @@ function SetMyKick_ShowMacroEditor()
 		local pt, _, rp, x, y = self:GetPoint()
 		DB.macroPoint = { pt, rp, x, y }
 	end)
-	tinsert(UISpecialFrames, "SetMyKickMacroFrame")
+	tinsert(UISpecialFrames, "KickAssistMacroFrame")
 
 	local close = CreateFrame("Button", nil, macroFrame, "UIPanelCloseButton")
 	close:SetPoint("TOPRIGHT", -4, -4)
@@ -632,7 +747,7 @@ function SetMyKick_ShowMacroEditor()
 	bodyLabel:SetPoint("TOPLEFT", 24, -132)
 	bodyLabel:SetText("Macro body ({interrupt} and {kick} are filled in for you):")
 
-	local scroll = CreateFrame("ScrollFrame", "SetMyKickMacroScroll", macroFrame, "InputScrollFrameTemplate")
+	local scroll = CreateFrame("ScrollFrame", "KickAssistMacroScroll", macroFrame, "InputScrollFrameTemplate")
 	scroll:SetSize(372, 96)
 	scroll:SetPoint("TOPLEFT", 24, -152)
 	scroll.EditBox:SetMultiLine(true)
@@ -661,12 +776,14 @@ function SetMyKick_ShowMacroEditor()
 		local cfg = SLOT_CFG[editorSlot]
 		return DB[cfg.tmplKey] or cfg.defBody
 	end
+	local markerBtn  -- created below; only shown for the kick/focus slots (Tab Kick has no marker)
 	local function ReloadFields()
 		nameBox:SetText(CurrentName())
 		nameBox:SetCursorPosition(0)
 		scroll.EditBox:SetText(CurrentTemplate())
 		scroll.EditBox:SetCursorPosition(0)
 		scroll:SetVerticalScroll(0)
+		if markerBtn then markerBtn:SetShown(editorSlot == "kick" or editorSlot == "focus") end
 	end
 	local function ApplySlot(name, template)
 		local cfg = SLOT_CFG[editorSlot]
@@ -699,32 +816,97 @@ function SetMyKick_ShowMacroEditor()
 		end
 	end)
 
-	-- Pick an existing macro to manage; loads its name + body so you can add {kick}.
-	local macroDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
-	macroDrop:SetSize(150, 22)
-	macroDrop:SetPoint("LEFT", nameBox, "RIGHT", 12, 0)
-	macroDrop:SetDefaultText("Pick existing...")
-	macroDrop:SetupMenu(function(dropdown, root)
-		root:SetScrollMode(20 * 18)   -- cap at ~18 rows, scroll beyond that
-		local function AddMacro(actualIndex)
-			local mname, _, mbody = GetMacroInfo(actualIndex)
-			if mname and mname ~= "" then
-				root:CreateButton(mname, function()
-					nameBox:SetText(mname)
-					scroll.EditBox:SetText(mbody or "")
-				end)
+	-- Pick an existing macro to load it. Built as a plain ScrollFrame + buttons rather
+	-- than a WowStyle1Dropdown: the dropdown's ScrollBox compares a secret content
+	-- extent inside instances and throws under our taint. A plain ScrollFrame (same
+	-- tech as the body editor) is taint-safe, so the editor stays usable in dungeons.
+	local pickBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
+	pickBtn:SetSize(150, 22)
+	pickBtn:SetPoint("LEFT", nameBox, "RIGHT", 12, 0)
+	pickBtn:SetText("Import Existing")
+
+	local pickPanel = CreateFrame("Frame", nil, pickBtn, "BackdropTemplate")
+	pickPanel:SetSize(196, 210)
+	pickPanel:SetPoint("TOPLEFT", pickBtn, "BOTTOMLEFT", 0, -2)
+	pickPanel:SetFrameStrata("FULLSCREEN_DIALOG")
+	pickPanel:SetBackdrop({
+		bgFile = "Interface\\Buttons\\WHITE8X8",
+		edgeFile = "Interface\\Tooltips\\UI-Tooltip-Border", edgeSize = 12,
+		insets = { left = 3, right = 3, top = 3, bottom = 3 },
+	})
+	pickPanel:SetBackdropColor(0.05, 0.05, 0.05, 0.97)
+	pickPanel:SetBackdropBorderColor(0.5, 0.5, 0.5, 1)
+	pickPanel:Hide()
+
+	local pickScroll = CreateFrame("ScrollFrame", nil, pickPanel)
+	pickScroll:SetPoint("TOPLEFT", 6, -6)
+	pickScroll:SetPoint("BOTTOMRIGHT", -6, 6)
+	pickScroll:EnableMouseWheel(true)
+	local pickChild = CreateFrame("Frame", nil, pickScroll)
+	pickChild:SetSize(180, 10)
+	pickScroll:SetScrollChild(pickChild)
+	pickScroll:SetScript("OnMouseWheel", function(self, delta)
+		local maxScroll = math.max(0, pickChild:GetHeight() - self:GetHeight())
+		self:SetVerticalScroll(math.min(maxScroll, math.max(0, self:GetVerticalScroll() - delta * 36)))
+	end)
+
+	local pickRows = {}
+	local function PopulatePicker()
+		for _, r in ipairs(pickRows) do r:Hide() end
+		local count = 0
+		local function AddRow(actualIndex)
+			local mname = GetMacroInfo(actualIndex)
+			if not mname or mname == "" then return end
+			count = count + 1
+			local r = pickRows[count]
+			if not r then
+				r = CreateFrame("Button", nil, pickChild)
+				r:SetHeight(18)
+				r:SetHighlightTexture("Interface\\QuestFrame\\UI-QuestTitleHighlight", "ADD")
+				r.text = r:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+				r.text:SetPoint("LEFT", 6, 0)
+				r.text:SetPoint("RIGHT", -4, 0)
+				r.text:SetJustifyH("LEFT")
+				pickRows[count] = r
 			end
+			r:SetPoint("TOPLEFT", pickChild, "TOPLEFT", 0, -(count - 1) * 18)
+			r:SetPoint("TOPRIGHT", pickChild, "TOPRIGHT", 0, -(count - 1) * 18)
+			r.text:SetText(mname)
+			r._idx = actualIndex
+			r:SetScript("OnClick", function(self)
+				-- Import the BODY only into the slot you're editing. The addon keeps
+				-- managing its own macro (the name above is unchanged) -- picking copies
+				-- commands in as a starting point, it does NOT repoint to this macro.
+				local _, _, body = GetMacroInfo(self._idx)
+				scroll.EditBox:SetText(body or "")
+				scroll.EditBox:SetCursorPosition(0)
+				scroll:SetVerticalScroll(0)
+				pickPanel:Hide()
+			end)
+			r:Show()
 		end
 		local numAccount, numChar = GetNumMacros()
-		for i = 1, numAccount do AddMacro(i) end
-		for i = 1, numChar do AddMacro(MAX_ACCOUNT_MACROS + i) end
+		for i = 1, numAccount do AddRow(i) end
+		for i = 1, numChar do AddRow(MAX_ACCOUNT_MACROS + i) end
+		pickChild:SetHeight(math.max(1, count * 18))
+		pickScroll:SetVerticalScroll(0)
+	end
+
+	pickBtn:SetScript("OnClick", function()
+		if pickPanel:IsShown() then
+			pickPanel:Hide()
+		else
+			PopulatePicker()
+			pickPanel:Show()
+			pickPanel:Raise()
+		end
 	end)
 
 	local info = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
 	info:SetPoint("TOPLEFT", 24, -256)
 	info:SetPoint("TOPRIGHT", -24, -256)
 	info:SetJustifyH("LEFT")
-	info:SetText("Keep {kick} in the macro (you can move it, just don't delete it). Saving updates the chosen macro; the marker re-syncs when you pick. Drag it to your bars.")
+	info:SetText("Import Existing copies a macro's commands in as a starting point; Save writes them to the macro named above (the addon's own). For Focus + Kick and Set Focus, click \"Add / Sync {kick} Marker\" first to add the marker line.")
 
 	local saveBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
 	saveBtn:SetSize(170, 24)
@@ -735,6 +917,17 @@ function SetMyKick_ShowMacroEditor()
 		if nm == "" then nm = CurrentName() end
 		ApplySlot(nm, scroll.EditBox:GetText())
 		nameBox:SetText(nm)
+	end)
+
+	-- Add or sync the {kick} marker line in the body (kick/focus slots only; shown via ReloadFields).
+	markerBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
+	markerBtn:SetSize(210, 22)
+	markerBtn:SetPoint("BOTTOM", 0, 50)
+	markerBtn:SetText("Add / Sync {kick} Marker")
+	markerBtn:SetScript("OnClick", function()
+		scroll.EditBox:SetText(ManageMarkerInBody(scroll.EditBox:GetText()))
+		scroll.EditBox:SetCursorPosition(0)
+		scroll:SetVerticalScroll(0)
 	end)
 
 	local templateDrop = CreateFrame("DropdownButton", nil, macroFrame, "WowStyle1DropdownTemplate")
@@ -768,7 +961,6 @@ end
 --------------------------------------------------------------------------------
 
 local minimapBtn
-local settingsCategory
 
 local function OpenSettings()
 	if settingsCategory then
@@ -791,7 +983,7 @@ end
 
 local function CreateMinimapButton()
 	if minimapBtn then return end
-	local b = CreateFrame("Button", "SetMyKickMinimapButton", Minimap)
+	local b = CreateFrame("Button", "KickAssistMinimapButton", Minimap)
 	b:SetSize(31, 31)
 	b:SetFrameStrata("MEDIUM")
 	b:SetFrameLevel(8)
@@ -847,7 +1039,7 @@ end
 
 local function CreateSettingsPanel()
 	if settingsCategory then return end
-	local panel = CreateFrame("Frame", "SetMyKickSettingsPanel")
+	local panel = CreateFrame("Frame", "KickAssistSettingsPanel")
 	panel.name = "Kick Assist"
 
 	local title = panel:CreateFontString(nil, "ARTWORK", "GameFontNormalLarge")
@@ -870,7 +1062,7 @@ local function CreateSettingsPanel()
 	macroBtn:SetSize(220, 26)
 	macroBtn:SetPoint("TOPLEFT", openBtn, "BOTTOMLEFT", 0, -8)
 	macroBtn:SetText("Edit Kick Macro")
-	macroBtn:SetScript("OnClick", function() SetMyKick_ShowMacroEditor() end)
+	macroBtn:SetScript("OnClick", function() KickAssist_ShowMacroEditor() end)
 
 	local mmCB = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
 	mmCB:SetPoint("TOPLEFT", macroBtn, "BOTTOMLEFT", 0, -16)
@@ -882,6 +1074,26 @@ local function CreateSettingsPanel()
 	local mmLabel = mmCB:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 	mmLabel:SetPoint("LEFT", mmCB, "RIGHT", 2, 0)
 	mmLabel:SetText("Show minimap button")
+
+	-- Which instance types the ready-check popup/announce fires in.
+	local ctxHeader = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	ctxHeader:SetPoint("TOPLEFT", mmCB, "BOTTOMLEFT", 0, -18)
+	ctxHeader:SetText("Open / announce on ready check in:")
+
+	local anchor = ctxHeader
+	for _, key in ipairs(CONTEXT_ORDER) do
+		local cb = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+		cb:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", (anchor == ctxHeader) and 0 or 0, (anchor == ctxHeader) and -6 or -4)
+		cb:SetChecked(ContextEnabled(key))
+		cb:SetScript("OnClick", function(self)
+			DB.contexts = DB.contexts or {}
+			DB.contexts[key] = self:GetChecked() and true or false
+		end)
+		local lbl = cb:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+		lbl:SetPoint("LEFT", cb, "RIGHT", 2, 0)
+		lbl:SetText(CONTEXT_LABELS[key])
+		anchor = cb
+	end
 
 	local category = Settings.RegisterCanvasLayoutCategory(panel, "Kick Assist")
 	Settings.RegisterAddOnCategory(category)
@@ -900,8 +1112,8 @@ ev:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
 ev:SetScript("OnEvent", function(_, event, arg1)
 	if event == "ADDON_LOADED" then
 		if arg1 ~= ADDON then return end
-		SetMyKickDB = SetMyKickDB or {}
-		DB = SetMyKickDB
+		KickAssistDB = KickAssistDB or {}
+		DB = KickAssistDB
 		for k, v in pairs(DEFAULTS) do
 			if DB[k] == nil then
 				DB[k] = (type(v) == "table") and CopyTable(v) or v
@@ -909,9 +1121,15 @@ ev:SetScript("OnEvent", function(_, event, arg1)
 		end
 		CreateMinimapButton()
 		CreateSettingsPanel()
-		print(PREFIX .. "loaded. /smk to open.")
+		print(PREFIX .. "loaded. /ka to open.")
 	elseif event == "READY_CHECK" then
-		if DB and DB.showOnReadyCheck and InMythicDungeon() then ShowUI(true) end
+		-- In an enabled instance type: pop the picker (out of combat) and, before the
+		-- key locks chat, auto-announce your kick. Announce(true) self-skips once the
+		-- key is active, so it never causes a blocked-action error.
+		if DB and ShouldTriggerHere() then
+			if DB.showOnReadyCheck then ShowUI(true) end
+			if DB.announceOnReadyCheck then Announce(true) end
+		end
 	elseif event == "PLAYER_REGEN_ENABLED" then
 		-- Catch up any macro edits deferred from combat.
 		SyncMacros()
@@ -928,14 +1146,14 @@ end)
 -- Slash
 --------------------------------------------------------------------------------
 
-SLASH_SETMYKICK1 = "/smk"
-SLASH_SETMYKICK2 = "/setmykick"
-SlashCmdList["SETMYKICK"] = function(msg)
+SLASH_KICKASSIST1 = "/ka"
+SLASH_KICKASSIST2 = "/kickassist"
+SlashCmdList["KICKASSIST"] = function(msg)
 	msg = (msg or ""):lower():gsub("^%s+", ""):gsub("%s+$", "")
 	if msg == "hide" then
 		if frame then frame:Hide() end
 	elseif msg == "macro" then
-		SetMyKick_ShowMacroEditor()
+		KickAssist_ShowMacroEditor()
 	elseif msg == "options" or msg == "config" then
 		OpenSettings()
 	elseif msg == "minimap" then
@@ -944,6 +1162,6 @@ SlashCmdList["SETMYKICK"] = function(msg)
 	elseif msg == "" or msg == "show" then
 		ShowUI()
 	else
-		print(PREFIX .. "commands: /smk (open), /smk macro, /smk options, /smk minimap, /smk hide")
+		print(PREFIX .. "commands: /ka (open), /ka macro, /ka options, /ka minimap, /ka hide")
 	end
 end

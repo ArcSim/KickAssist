@@ -24,7 +24,7 @@ jobs:
         uses: BigWigsMods/packager@v2.5.1
         with:
           # Keep the default zip filename; set the CurseForge display label to
-          # "SetMyKick-<version>" (e.g. SetMyKick-1.0.0).
+          # "KickAssist-<version>" (e.g. KickAssist-1.0.0).
           args: '-n ":{package-name}-{project-version}"'
         env:
           CF_API_KEY: ${{ secrets.CF_API_KEY }}         # CurseForge upload token (repo secret)

@@ -1,6 +1,6 @@
 # CurseForge / BigWigs packager metadata.
 # Everything under `ignore` is left OUT of the packaged addon.
-package-as: SetMyKick
+package-as: KickAssist
 
 # Use our formatted changelog for the CurseForge / Wago file notes instead of
 # the packager's auto-generated commit-message list.

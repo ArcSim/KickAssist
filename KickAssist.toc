@@ -1,10 +1,11 @@
 ## Interface: 120005, 120007, 120100
 ## Title: Kick Assist
+## IconTexture: Interface\AddOns\KickAssist\Icon.tga
 ## Notes: Pick, track, and announce your interrupt (kick) raid marker for Mythic+ and ready checks.
 ## Author: ArcSim
 ## Version: 1.0.0
-## SavedVariablesPerCharacter: SetMyKickDB
+## SavedVariablesPerCharacter: KickAssistDB
 ## X-Curse-Project-ID: 1582317
 ## X-Wago-ID: QN53zPKB
 
-SetMyKick.lua
+KickAssist.lua

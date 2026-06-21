@@ -537,7 +537,8 @@ end
 
 local function ShowUI(fromEvent)
 	if InCombatLockdown() then
-		print(PREFIX .. "in combat, not opening (this is an out-of-combat tool).")
+		-- Only tell the user when THEY asked (a trigger like a mid-key ready check stays silent).
+		if not fromEvent then print(PREFIX .. "in combat, not opening (this is an out-of-combat tool).") end
 		return
 	end
 	CreateUI()

@@ -17,20 +17,22 @@ local ADDON = ...
 -- can be blocked, in which case the button still works.
 --------------------------------------------------------------------------------
 
--- {interrupt} = your spec's interrupt, {kick} = your marker. The ~ before {kick}
--- marks only if the target has no marker yet, so re-pressing never removes/overwrites
--- a mark. The default Focus+Kick casts before setting focus, so the first press sets
--- focus and the next press kicks it (no modifier, no mouseover).
+-- {interrupt} = your spec's interrupt, {marker} = your marker. Marking is always on
+-- @focus, and the ~ before {marker} marks only if your focus has no marker yet, so the
+-- marker is placed when you set your focus and then stays put: re-pressing kicks the
+-- focus and never moves the marker onto whatever you happen to be targeting. The
+-- default Focus+Kick casts before setting focus, so the first press sets focus and the
+-- next press kicks it (no modifier, no mouseover).
 local DEFAULT_MACRO =
 	"#showtooltip {interrupt}\n" ..
 	"/cast [@focus,harm,nodead] {interrupt}\n" ..
 	"/focus [@focus,noexists] target\n" ..
-	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
+	"/tm [@focus] ~{marker}"
 
 -- Set focus + mark; no #showtooltip so it keeps the targeting icon.
 local SET_FOCUS_MACRO =
 	"/focus target\n" ..
-	"/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
+	"/tm [@focus] ~{marker}"
 
 -- Auto tab kick (default): tab to the nearest enemy, interrupt, return to your target.
 local AUTOTAB_MACRO =
@@ -72,14 +74,14 @@ local TEMPLATES = {
 	kick = {
 		{ name = "Focus + Kick (default, re-press to kick)", body = DEFAULT_MACRO },
 		{ name = "Focus + Kick (Ctrl to kick your target)",
-		  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" },
+		  body = "#showtooltip {interrupt}\n/cast [nomod:ctrl,@focus,harm,nodead][] {interrupt}\n/focus [@focus,noexists] target\n/tm [@focus] ~{marker}" },
 		{ name = "Focus + Kick (mouseover)",
-		  body = "#showtooltip {interrupt}\n/cast [@focus,harm,nodead] {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
+		  body = "#showtooltip {interrupt}\n/cast [@focus,harm,nodead] {interrupt}\n/focus [@mouseover,harm,nodead,exists] mouseover\n/tm [@focus] ~{marker}" },
 	},
 	focus = {
 		{ name = "Set focus (target)", body = SET_FOCUS_MACRO },
 		{ name = "Set focus (mouseover)",
-		  body = "/focus [@mouseover,exists] mouseover\n/tm [@mouseover,exists][] ~{kick}" },
+		  body = "/focus [@mouseover,exists] mouseover\n/tm [@focus] ~{marker}" },
 	},
 	autotab = {
 		{ name = "Auto Tab Kick (tab to nearest)", body = AUTOTAB_MACRO },
@@ -102,7 +104,7 @@ local DEFAULTS = {
 	announceOnReadyCheck = true,         -- post your kick to chat on a ready check (sends before a key; auto-skips once chat is locked)
 	-- Which instances the ready-check popup/announce fires in (default: Mythic dungeons only).
 	contexts             = { mplus = true, mythic = true, heroic = false, normal = false, raid = false },
-	autoAnnounce         = false,        -- announce automatically when the popup opens (off: click to announce)
+	smartOpen            = false,        -- on a ready check, wait and open only if someone else calls your marker
 	message              = "My Focus Kick is %MARKER%",
 	point                = { "CENTER", "CENTER", 0, 140 },
 
@@ -131,6 +133,36 @@ local DB           -- resolved at ADDON_LOADED
 local frame        -- main popup, created lazily
 local macroFrame   -- macro editor, created lazily
 local settingsCategory  -- Blizzard settings category (set in CreateSettingsPanel)
+local myName             -- our character name, cached while readable (UnitName is secret inside M+)
+local smartOpenExpire = 0  -- GetTime() until which Smart Open watches party chat
+
+-- Cache our own name while it is readable. UnitName("player") is secret inside instances,
+-- so we grab it on login / zoning (out in the world it is not secret) and reuse that string
+-- to recognize our own chat echo during a key.
+local function RememberMyName()
+	local n = UnitName("player")
+	if n and not issecretvalue(n) then myName = n end
+end
+
+-- Marker index -> spoken token names, so Smart Open also catches manual callouts.
+local MARKER_TOKENS = {
+	[1] = { "star" }, [2] = { "circle", "coin" }, [3] = { "diamond" }, [4] = { "triangle" },
+	[5] = { "moon" }, [6] = { "square" }, [7] = { "cross", "x" }, [8] = { "skull" },
+}
+
+-- Does an incoming chat message call out YOUR marker? Matches {rtN}, the named token
+-- ({skull} etc.) and the rendered icon escape. Pure string parsing, so taint-safe in M+.
+local function MessageCallsMyMarker(text)
+	local m = DB and DB.marker
+	if not text or issecretvalue(text) or not m or m < 1 or m > 8 then return false end
+	text = text:lower()
+	if text:find("{rt" .. m .. "}", 1, true) then return true end
+	if text:find("raidtargetingicon_" .. m, 1, true) then return true end
+	for _, name in ipairs(MARKER_TOKENS[m]) do
+		if text:find("{" .. name .. "}", 1, true) then return true end
+	end
+	return false
+end
 
 --------------------------------------------------------------------------------
 -- Helpers
@@ -293,32 +325,32 @@ local function ReplaceTmMarkers(s, replacement)
 end
 
 -- Make an existing macro body marker-managed for the "pick existing macro" flow:
--- in its first /tm line swap the marker number(s) for {kick} (adding ~{kick} if that
+-- in its first /tm line swap the marker number(s) for {marker} (adding ~{marker} if that
 -- line has no number yet); if there is no /tm line at all, append one. Everything
 -- else in the macro is left exactly as the player wrote it.
 local function ManageMarkerInBody(body)
 	body = tostring(body or ""):gsub("[\r\n]+$", "")
-	if body == "" then return "/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}" end
+	if body == "" then return "/tm [@focus] ~{marker}" end
 	local lines, handled = {}, false
 	for line in (body .. "\n"):gmatch("(.-)\n") do
 		if not handled then
 			local prefix, rest = line:match("^(%s*/[tT][mM])(.*)$")
 			if prefix and (rest == "" or rest:match("^[%s%[~!0-8]")) then
-				local newRest, n = ReplaceTmMarkers(rest, "{kick}")
+				local newRest, n = ReplaceTmMarkers(rest, "{marker}")
 				line = prefix .. newRest
-				if n == 0 then line = line .. " ~{kick}" end
+				if n == 0 then line = line .. " ~{marker}" end
 				handled = true
 			end
 		end
 		lines[#lines + 1] = line
 	end
 	if not handled then
-		lines[#lines + 1] = "/tm [@target,noexists][@target,dead] ~{kick}; ~{kick}"
+		lines[#lines + 1] = "/tm [@focus] ~{marker}"
 	end
 	return table.concat(lines, "\n")
 end
 
--- Rewrite the managed macro so {kick} matches the chosen marker. Out of combat
+-- Rewrite the managed macro so {marker} matches the chosen marker. Out of combat
 -- only (EditMacro / CreateMacro are blocked in combat).
 local function UpdateManagedMacro()
 	if not (DB and DB.macroEnabled) then return end
@@ -327,7 +359,7 @@ local function UpdateManagedMacro()
 	local name = DB.macroName ~= "" and DB.macroName or DEFAULTS.macroName
 	local interrupt = GetMyInterruptName() or ""
 	local body = tostring(DB.macroTemplate or DEFAULT_MACRO)
-	body = body:gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
+	body = body:gsub("{interrupt}", interrupt):gsub("{marker}", tostring(DB.marker)):gsub("{kick}", tostring(DB.marker))
 	if body == "" then return end
 
 	local idx = GetMacroIndexByName(name)
@@ -348,7 +380,7 @@ local function UpdateSetFocusMacro(create)
 	if InCombatLockdown() then return end
 	local name = DB.setFocusName ~= "" and DB.setFocusName or DEFAULTS.setFocusName
 	local interrupt = GetMyInterruptName() or ""
-	local body = tostring(DB.setFocusTemplate or SET_FOCUS_MACRO):gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
+	local body = tostring(DB.setFocusTemplate or SET_FOCUS_MACRO):gsub("{interrupt}", interrupt):gsub("{marker}", tostring(DB.marker)):gsub("{kick}", tostring(DB.marker))
 	local idx = GetMacroIndexByName(name)
 	if idx and idx > 0 then
 		EditMacro(idx, name, FOCUS_ICON, body)
@@ -367,7 +399,7 @@ local function UpdateAutoTabMacro(create)
 	if InCombatLockdown() then return end
 	local name = DB.autoTabName ~= "" and DB.autoTabName or DEFAULTS.autoTabName
 	local interrupt = GetMyInterruptName() or ""
-	local body = tostring(DB.autoTabTemplate or AUTOTAB_MACRO):gsub("{interrupt}", interrupt):gsub("{kick}", tostring(DB.marker))
+	local body = tostring(DB.autoTabTemplate or AUTOTAB_MACRO):gsub("{interrupt}", interrupt):gsub("{marker}", tostring(DB.marker)):gsub("{kick}", tostring(DB.marker))
 	local idx = GetMacroIndexByName(name)
 	if idx and idx > 0 then
 		EditMacro(idx, name, QUESTION_ICON, body)
@@ -533,9 +565,9 @@ local function CreateUI()
 		function() return DB.showOnReadyCheck end,
 		function(v) DB.showOnReadyCheck = v end)
 
-	frame.autoCB = MakeCheck(frame, "Auto-announce when opened", 22, -220,
-		function() return DB.autoAnnounce end,
-		function(v) DB.autoAnnounce = v end)
+	frame.smartCB = MakeCheck(frame, "Smart open (only on a marker clash)", 22, -220,
+		function() return DB.smartOpen end,
+		function(v) DB.smartOpen = v end)
 
 	frame.announceCB = MakeCheck(frame, "Announce on ready check", 22, -244,
 		function() return DB.announceOnReadyCheck end,
@@ -658,17 +690,13 @@ local function ShowUI(fromEvent)
 	CreateUI()
 	UpdateSelection()
 	frame.readyCB:Refresh()
-	frame.autoCB:Refresh()
+	frame.smartCB:Refresh()
 	frame.announceCB:Refresh()
 	frame.msgBox:SetText(DB.message or DEFAULTS.message)
 	RefreshDragIcons()
 	SyncMacros()
 	frame:Show()
 	frame:Raise()
-	-- Auto-announce only when YOU opened it (a click or /ka). On a trigger like the
-	-- ready check (fromEvent), skip it: an automated SendChatMessage inside an instance
-	-- is blocked. Your marker/Announce clicks are hardware events and always send.
-	if DB.autoAnnounce and not fromEvent then Announce() end
 end
 
 -- Global opener so ArcUI (or any addon) can open the window.
@@ -682,7 +710,7 @@ local editorSlot = "kick"  -- which macro the editor edits: "kick" or "focus"
 
 local function MacroNoteText()
 	return "{interrupt} fills in your interrupt (now: " ..
-		(GetMyInterruptName() or "none for this spec") .. "); {kick} fills in your marker."
+		(GetMyInterruptName() or "none for this spec") .. "); {marker} fills in your marker."
 end
 
 function KickAssist_ShowMacroEditor()
@@ -745,7 +773,7 @@ function KickAssist_ShowMacroEditor()
 
 	local bodyLabel = macroFrame:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
 	bodyLabel:SetPoint("TOPLEFT", 24, -132)
-	bodyLabel:SetText("Macro body ({interrupt} and {kick} are filled in for you):")
+	bodyLabel:SetText("Macro body ({interrupt} and {marker} are filled in for you):")
 
 	local scroll = CreateFrame("ScrollFrame", "KickAssistMacroScroll", macroFrame, "InputScrollFrameTemplate")
 	scroll:SetSize(372, 96)
@@ -906,7 +934,7 @@ function KickAssist_ShowMacroEditor()
 	info:SetPoint("TOPLEFT", 24, -256)
 	info:SetPoint("TOPRIGHT", -24, -256)
 	info:SetJustifyH("LEFT")
-	info:SetText("Import Existing copies a macro's commands in as a starting point; Save writes them to the macro named above (the addon's own). For Focus + Kick and Set Focus, click \"Add / Sync {kick} Marker\" first to add the marker line.")
+	info:SetText("Import Existing copies a macro's commands in as a starting point; Save writes them to the macro named above (the addon's own). For Focus + Kick and Set Focus, click \"Add / Sync Marker Line\" first to add the marker line.")
 
 	local saveBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
 	saveBtn:SetSize(170, 24)
@@ -919,11 +947,11 @@ function KickAssist_ShowMacroEditor()
 		nameBox:SetText(nm)
 	end)
 
-	-- Add or sync the {kick} marker line in the body (kick/focus slots only; shown via ReloadFields).
+	-- Add or sync the {marker} marker line in the body (kick/focus slots only; shown via ReloadFields).
 	markerBtn = CreateFrame("Button", nil, macroFrame, "UIPanelButtonTemplate")
 	markerBtn:SetSize(210, 22)
 	markerBtn:SetPoint("BOTTOM", 0, 50)
-	markerBtn:SetText("Add / Sync {kick} Marker")
+	markerBtn:SetText("Add / Sync Marker Line")
 	markerBtn:SetScript("OnClick", function()
 		scroll.EditBox:SetText(ManageMarkerInBody(scroll.EditBox:GetText()))
 		scroll.EditBox:SetCursorPosition(0)
@@ -1109,7 +1137,29 @@ ev:RegisterEvent("ADDON_LOADED")
 ev:RegisterEvent("READY_CHECK")
 ev:RegisterEvent("PLAYER_REGEN_ENABLED")
 ev:RegisterEvent("PLAYER_SPECIALIZATION_CHANGED")
-ev:SetScript("OnEvent", function(_, event, arg1)
+ev:RegisterEvent("PLAYER_ENTERING_WORLD")
+
+-- Smart Open: for a brief window after a ready check, watch party/raid chat; if someone
+-- ELSE calls out your marker, open the picker so you can change your focus. Chat text is
+-- non-secret, so this stays taint-safe in M+ (unlike reading raid markers off units).
+local SMART_OPEN_WINDOW = 4  -- seconds to watch after a ready check
+local SMART_CHAT_EVENTS = {
+	"CHAT_MSG_PARTY", "CHAT_MSG_PARTY_LEADER", "CHAT_MSG_RAID",
+	"CHAT_MSG_RAID_LEADER", "CHAT_MSG_INSTANCE_CHAT", "CHAT_MSG_INSTANCE_CHAT_LEADER",
+}
+local function DisarmSmartOpen()
+	smartOpenExpire = 0
+	for _, e in ipairs(SMART_CHAT_EVENTS) do ev:UnregisterEvent(e) end
+end
+local function ArmSmartOpen()
+	smartOpenExpire = GetTime() + SMART_OPEN_WINDOW
+	for _, e in ipairs(SMART_CHAT_EVENTS) do ev:RegisterEvent(e) end
+	C_Timer.After(SMART_OPEN_WINDOW + 0.1, function()
+		if GetTime() >= smartOpenExpire then DisarmSmartOpen() end
+	end)
+end
+
+ev:SetScript("OnEvent", function(_, event, arg1, arg2)
 	if event == "ADDON_LOADED" then
 		if arg1 ~= ADDON then return end
 		KickAssistDB = KickAssistDB or {}
@@ -1123,12 +1173,26 @@ ev:SetScript("OnEvent", function(_, event, arg1)
 		CreateSettingsPanel()
 		print(PREFIX .. "loaded. /ka to open.")
 	elseif event == "READY_CHECK" then
-		-- In an enabled instance type: pop the picker (out of combat) and, before the
-		-- key locks chat, auto-announce your kick. Announce(true) self-skips once the
-		-- key is active, so it never causes a blocked-action error.
+		-- In an enabled instance type, announce your kick (Announce self-skips once the key
+		-- locks chat). Then either open the picker now, or with Smart Open, arm a brief
+		-- chat watch and only open if someone else calls your marker.
 		if DB and ShouldTriggerHere() then
-			if DB.showOnReadyCheck then ShowUI(true) end
+			if DB.showOnReadyCheck then
+				if DB.smartOpen then ArmSmartOpen() else ShowUI(true) end
+			end
 			if DB.announceOnReadyCheck then Announce(true) end
+		end
+	elseif event == "CHAT_MSG_PARTY" or event == "CHAT_MSG_PARTY_LEADER"
+		or event == "CHAT_MSG_RAID" or event == "CHAT_MSG_RAID_LEADER"
+		or event == "CHAT_MSG_INSTANCE_CHAT" or event == "CHAT_MSG_INSTANCE_CHAT_LEADER" then
+		-- Smart Open watch window. arg1 = message text, arg2 = sender. Skip your own echo
+		-- (sender matches your cached name), then if another player calls your marker, open.
+		if GetTime() > smartOpenExpire then
+			DisarmSmartOpen()
+		elseif myName and arg2 and not issecretvalue(arg2)
+			and arg2:match("^[^-]+") ~= myName and MessageCallsMyMarker(arg1) then
+			DisarmSmartOpen()
+			ShowUI(true)
 		end
 	elseif event == "PLAYER_REGEN_ENABLED" then
 		-- Catch up any macro edits deferred from combat.
@@ -1139,6 +1203,8 @@ ev:SetScript("OnEvent", function(_, event, arg1)
 			SyncMacros()
 			if macroFrame and macroFrame:IsShown() then macroFrame.note:SetText(MacroNoteText()) end
 		end
+	elseif event == "PLAYER_ENTERING_WORLD" then
+		RememberMyName()  -- cache our name out in the world (it is secret inside M+)
 	end
 end)
 

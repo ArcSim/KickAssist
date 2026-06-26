@@ -105,6 +105,11 @@ local DEFAULTS = {
 	-- Which instances the ready-check popup/announce fires in (default: Mythic dungeons only).
 	contexts             = { mplus = true, mythic = true, heroic = false, normal = false, raid = false },
 	smartOpen            = false,        -- on a ready check, wait and open only if someone else calls your marker
+	interruptAlert       = false,        -- sound/TTS when your FOCUS starts casting and your interrupt is ready
+	interruptAlertTTS    = false,        -- alert via spoken text (TTS) instead of a sound
+	interruptAlertText   = "Kick",       -- the TTS phrase
+	interruptAlertSound  = "Default",    -- sound to play (non-TTS): "Default", "None", a built-in name, or a LibSharedMedia sound
+	interruptAlertChannel = "Master",    -- sound channel
 	message              = "My Focus Kick is %MARKER%",
 	point                = { "CENTER", "CENTER", 0, 140 },
 
@@ -479,7 +484,7 @@ local function CreateUI()
 	if frame then return frame end
 
 	frame = CreateFrame("Frame", "KickAssistFrame", UIParent, "BackdropTemplate")
-	frame:SetSize(300, 476)
+	frame:SetSize(300, 560)
 	frame:SetFrameStrata("DIALOG")
 	frame:SetToplevel(true)
 	frame:SetClampedToScreen(true)
@@ -673,6 +678,22 @@ local function CreateUI()
 	end)
 	RefreshDragIcons()
 
+	-- Interrupt Alert: surfaced here so it's discoverable. The enable toggle lives
+	-- here; the sound/TTS/channel choices are in Options.
+	local alertHeader = frame:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	alertHeader:SetPoint("TOPLEFT", 22, -464)
+	alertHeader:SetText("Interrupt Alert")
+
+	frame.alertCB = MakeCheck(frame, "Play a sound when your focus casts", 22, -482,
+		function() return DB.interruptAlert end,
+		function(v) DB.interruptAlert = v; SyncInterruptAlert() end)
+
+	local alertHint = frame:CreateFontString(nil, "OVERLAY", "GameFontDisableSmall")
+	alertHint:SetPoint("TOPLEFT", 26, -508)
+	alertHint:SetPoint("RIGHT", frame, "RIGHT", -16, 0)
+	alertHint:SetJustifyH("LEFT")
+	alertHint:SetText("Fires when your focus casts and your kick is ready. Pick the sound, TTS, and channel in Options.")
+
 	local p = DB.point or DEFAULTS.point
 	frame:ClearAllPoints()
 	frame:SetPoint(p[1], UIParent, p[2], p[3], p[4])
@@ -692,6 +713,7 @@ local function ShowUI(fromEvent)
 	frame.readyCB:Refresh()
 	frame.smartCB:Refresh()
 	frame.announceCB:Refresh()
+	frame.alertCB:Refresh()
 	frame.msgBox:SetText(DB.message or DEFAULTS.message)
 	RefreshDragIcons()
 	SyncMacros()
@@ -1065,6 +1087,113 @@ local function CreateMinimapButton()
 	UpdateMinimapShown()
 end
 
+--------------------------------------------------------------------------------
+-- Interrupt Alert: sound/TTS when your FOCUS starts casting AND your interrupt is
+-- ready. We cannot tell if the cast is interruptible (UnitCastingInfo.notInterruptible
+-- is secret in M+, and the INTERRUPTIBLE events don't fire for enemies), so this fires
+-- on any focus cast while your kick is up; pair with a cast-bar addon for the visual
+-- interruptible cue. Everything here is non-secret.
+--------------------------------------------------------------------------------
+
+-- Hidden shadow Cooldown for a non-secret "is my interrupt ready" read: feed the
+-- interrupt's cooldown duration object, then IsShown() == on cooldown.
+local interruptCD = CreateFrame("Cooldown", nil, UIParent, "CooldownFrameTemplate")
+interruptCD:SetSize(1, 1)
+interruptCD:SetPoint("TOPLEFT", UIParent, "BOTTOMLEFT", -100, -100)
+interruptCD:SetAlpha(0)
+interruptCD:EnableMouse(false)
+interruptCD:SetHideCountdownNumbers(true)
+interruptCD:SetDrawEdge(false)
+interruptCD:SetDrawBling(false)
+interruptCD:Show()
+
+local function InterruptReady()
+	local id = GetMyInterruptID()
+	if not id or not (C_Spell and C_Spell.GetSpellCooldownDuration) then return false end
+	local dur = C_Spell.GetSpellCooldownDuration(id, true)
+	if not dur then return false end
+	interruptCD:SetCooldownFromDurationObject(dur, true)
+	return not interruptCD:IsShown()
+end
+
+local function TTSVoice()
+	local v = C_VoiceChat and C_VoiceChat.GetTtsVoices and C_VoiceChat.GetTtsVoices()
+	return (v and v[1] and v[1].voiceID) or 0
+end
+
+-- Built-in alert sounds, always available (no LibSharedMedia needed). "Default"
+-- maps to Ready Check (the original alert sound).
+local BUILTIN_SOUNDS = {
+	["Ready Check"]  = SOUNDKIT.READY_CHECK,
+	["Raid Warning"] = SOUNDKIT.RAID_WARNING,
+	["Alarm Clock"]  = SOUNDKIT.ALARM_CLOCK_WARNING_3,
+	["Boss Whisper"] = SOUNDKIT.UI_RAID_BOSS_WHISPER_WARNING,
+	["Map Ping"]     = SOUNDKIT.MAP_PING,
+	["BNet Toast"]   = SOUNDKIT.UI_BNET_TOAST,
+	["Whisper"]      = SOUNDKIT.TELL_MESSAGE,
+}
+local BUILTIN_ORDER = { "Ready Check", "Raid Warning", "Alarm Clock", "Boss Whisper", "Map Ping", "BNet Toast", "Whisper" }
+
+-- Ordered list of selectable sounds: Default, the built-ins, any LibSharedMedia
+-- sounds (if another addon provides the library), then None. LibStub is guarded
+-- so the standalone works with or without LSM present.
+local function GetSoundList()
+	local list, seen = { "Default" }, { Default = true, None = true }
+	for _, name in ipairs(BUILTIN_ORDER) do
+		if not seen[name] then list[#list + 1] = name; seen[name] = true end
+	end
+	local lsm = LibStub and LibStub("LibSharedMedia-3.0", true)
+	if lsm then
+		for _, name in ipairs(lsm:List("sound") or {}) do
+			if not seen[name] then list[#list + 1] = name; seen[name] = true end
+		end
+	end
+	list[#list + 1] = "None"
+	return list
+end
+
+-- Play the configured interrupt-alert sound.
+local function PlayInterruptSound()
+	local name    = DB.interruptAlertSound or "Default"
+	local channel = DB.interruptAlertChannel or "Master"
+	if name == "None" then return end
+	if name == "Default" then PlaySound(SOUNDKIT.READY_CHECK, channel); return end
+	local builtin = BUILTIN_SOUNDS[name]
+	if builtin then PlaySound(builtin, channel); return end
+	local lsm = LibStub and LibStub("LibSharedMedia-3.0", true)
+	local path = lsm and lsm:Fetch("sound", name, true)
+	if path then PlaySoundFile(path, channel)
+	else PlaySound(SOUNDKIT.READY_CHECK, channel) end
+end
+
+local lastInterruptAlert = 0
+local function FireInterruptAlert()
+	if (GetTime() - lastInterruptAlert) < 1.5 then return end  -- throttle
+	lastInterruptAlert = GetTime()
+	if DB.interruptAlertTTS then
+		if C_VoiceChat and C_VoiceChat.SpeakText then
+			C_VoiceChat.SpeakText(TTSVoice(), DB.interruptAlertText or "Kick", 0, 100)
+		end
+	else
+		PlayInterruptSound()
+	end
+end
+
+local alertFrame = CreateFrame("Frame")
+alertFrame:SetScript("OnEvent", function()
+	if DB and DB.interruptAlert and InterruptReady() then FireInterruptAlert() end
+end)
+
+-- Register the focus cast events only while the alert is enabled (zero idle cost).
+local function SyncInterruptAlert()
+	if DB and DB.interruptAlert then
+		alertFrame:RegisterUnitEvent("UNIT_SPELLCAST_START", "focus")
+		alertFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", "focus")
+	else
+		alertFrame:UnregisterAllEvents()
+	end
+end
+
 local function CreateSettingsPanel()
 	if settingsCategory then return end
 	local panel = CreateFrame("Frame", "KickAssistSettingsPanel")
@@ -1123,6 +1252,95 @@ local function CreateSettingsPanel()
 		anchor = cb
 	end
 
+	-- Interrupt Alert: sound/TTS when your focus casts and your kick is ready.
+	local iaHeader = panel:CreateFontString(nil, "OVERLAY", "GameFontNormal")
+	iaHeader:SetPoint("TOPLEFT", anchor, "BOTTOMLEFT", 0, -16)
+	iaHeader:SetText("Interrupt Alert (watches your focus):")
+
+	local iaCB = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+	iaCB:SetPoint("TOPLEFT", iaHeader, "BOTTOMLEFT", 0, -6)
+	iaCB:SetChecked(DB.interruptAlert)
+	iaCB:SetScript("OnClick", function(self)
+		DB.interruptAlert = self:GetChecked() and true or false
+		SyncInterruptAlert()
+	end)
+	local iaLbl = iaCB:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	iaLbl:SetPoint("LEFT", iaCB, "RIGHT", 2, 0)
+	iaLbl:SetText("Alert when your focus starts casting and your kick is ready")
+
+	local ttsCB = CreateFrame("CheckButton", nil, panel, "UICheckButtonTemplate")
+	ttsCB:SetPoint("TOPLEFT", iaCB, "BOTTOMLEFT", 0, -4)
+	ttsCB:SetChecked(DB.interruptAlertTTS)
+	ttsCB:SetScript("OnClick", function(self)
+		DB.interruptAlertTTS = self:GetChecked() and true or false
+	end)
+	local ttsLbl = ttsCB:CreateFontString(nil, "OVERLAY", "GameFontHighlight")
+	ttsLbl:SetPoint("LEFT", ttsCB, "RIGHT", 2, 0)
+	ttsLbl:SetText("Speak it (TTS) instead of a sound")
+
+	-- Spoken phrase for TTS (sits to the right of the TTS toggle).
+	local ttsPhraseLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	ttsPhraseLabel:SetPoint("LEFT", ttsLbl, "RIGHT", 16, 0)
+	ttsPhraseLabel:SetText("Phrase:")
+
+	local ttsBox = CreateFrame("EditBox", nil, panel, "InputBoxTemplate")
+	ttsBox:SetSize(120, 20)
+	ttsBox:SetPoint("LEFT", ttsPhraseLabel, "RIGHT", 8, 0)
+	ttsBox:SetAutoFocus(false)
+	ttsBox:SetText(DB.interruptAlertText or "Kick")
+	ttsBox:SetScript("OnEscapePressed", ttsBox.ClearFocus)
+	local function CommitTTS(self)
+		local t = (self:GetText() or ""):gsub("^%s+", ""):gsub("%s+$", "")
+		if t == "" then t = "Kick" end
+		DB.interruptAlertText = t
+		self:SetText(t)
+		self:ClearFocus()
+	end
+	ttsBox:SetScript("OnEnterPressed", CommitTTS)
+	ttsBox:SetScript("OnEditFocusLost", CommitTTS)
+
+	-- Alert sound (non-TTS): same sound choices as Cooldown Reminders.
+	local sndLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	sndLabel:SetPoint("TOPLEFT", ttsCB, "BOTTOMLEFT", 4, -10)
+	sndLabel:SetText("Alert sound:")
+
+	local sndDrop = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
+	sndDrop:SetSize(180, 22)
+	sndDrop:SetPoint("TOPLEFT", sndLabel, "BOTTOMLEFT", -2, -4)
+	sndDrop:SetupMenu(function(dropdown, root)
+		root:SetScrollMode(20 * 16)
+		for _, name in ipairs(GetSoundList()) do
+			root:CreateRadio(name,
+				function() return (DB.interruptAlertSound or "Default") == name end,
+				function() DB.interruptAlertSound = name; PlayInterruptSound() end,
+				name)
+		end
+	end)
+
+	local previewBtn = CreateFrame("Button", nil, panel, "UIPanelButtonTemplate")
+	previewBtn:SetSize(90, 22)
+	previewBtn:SetPoint("LEFT", sndDrop, "RIGHT", 8, 0)
+	previewBtn:SetText("Preview")
+	previewBtn:SetScript("OnClick", PlayInterruptSound)
+
+	-- Sound channel.
+	local chLabel = panel:CreateFontString(nil, "OVERLAY", "GameFontHighlightSmall")
+	chLabel:SetPoint("TOPLEFT", sndDrop, "BOTTOMLEFT", 2, -10)
+	chLabel:SetText("Sound channel:")
+
+	local CHANNELS = { "Master", "SFX", "Music", "Ambience", "Dialog" }
+	local chDrop = CreateFrame("DropdownButton", nil, panel, "WowStyle1DropdownTemplate")
+	chDrop:SetSize(140, 22)
+	chDrop:SetPoint("TOPLEFT", chLabel, "BOTTOMLEFT", -2, -4)
+	chDrop:SetupMenu(function(dropdown, root)
+		for _, ch in ipairs(CHANNELS) do
+			root:CreateRadio(ch,
+				function() return (DB.interruptAlertChannel or "Master") == ch end,
+				function() DB.interruptAlertChannel = ch end,
+				ch)
+		end
+	end)
+
 	local category = Settings.RegisterCanvasLayoutCategory(panel, "Kick Assist")
 	Settings.RegisterAddOnCategory(category)
 	settingsCategory = category
@@ -1171,6 +1389,7 @@ ev:SetScript("OnEvent", function(_, event, arg1, arg2)
 		end
 		CreateMinimapButton()
 		CreateSettingsPanel()
+		SyncInterruptAlert()
 		print(PREFIX .. "loaded. /ka to open.")
 	elseif event == "READY_CHECK" then
 		-- In an enabled instance type, announce your kick (Announce self-skips once the key

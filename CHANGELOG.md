@@ -1,13 +1,5 @@
-## 1.0.1
+## 1.0.2
 
 ### New Features
 
-- **Smart Open**: A new opt-in way to handle ready checks. Instead of opening right away, Kick Assist watches party chat for a few seconds and opens the picker only if someone else calls the same marker as yours, so you can change your focus and avoid the clash. Off by default.
-
-### Improvements
-
-- **Clearer Macro Placeholder**: The macro placeholder is now {marker} instead of {kick}, which reads more naturally. Any macros you already saved keep working.
-
-### Bug Fixes
-
-- **Marker Stays on Your Focus**: The kick macros now mark your focus and leave the marker there. Before, pressing the macro while targeting a different mob could pull your raid marker onto that target.
+- **Interrupt Alert**: Get a sound or spoken (text-to-speech) alert the moment your focus starts casting and your interrupt is off cooldown, so you know to look and kick. Pick from built-in alert sounds or any LibSharedMedia sound, choose the sound channel, set your own spoken word, and preview it. Off by default; enable it from the main window or Options.

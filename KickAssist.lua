@@ -1,5 +1,11 @@
 local ADDON = ...
 
+-- Forward-declared: the options-panel checkbox setter (~line 689) references this
+-- lexically ABOVE the definition further down, so without this declaration the name
+-- there binds to a nil global and throws "attempt to call a nil value" on click.
+-- The definition below assigns to this local instead of creating a new one.
+local SyncInterruptAlert
+
 --------------------------------------------------------------------------------
 -- Kick Assist
 -- Pick your interrupt (kick) raid marker, announce it to the group, and keep
@@ -1185,7 +1191,8 @@ alertFrame:SetScript("OnEvent", function()
 end)
 
 -- Register the focus cast events only while the alert is enabled (zero idle cost).
-local function SyncInterruptAlert()
+-- (Assigns to the forward-declared local near the top of the file.)
+function SyncInterruptAlert()
 	if DB and DB.interruptAlert then
 		alertFrame:RegisterUnitEvent("UNIT_SPELLCAST_START", "focus")
 		alertFrame:RegisterUnitEvent("UNIT_SPELLCAST_CHANNEL_START", "focus")

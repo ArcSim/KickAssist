@@ -1,3 +1,9 @@
+## 1.0.3
+
+### Bug Fixes
+
+- **Interrupt Alert toggle**: Fixed a Lua error ("attempt to call a nil value") when turning the "Play a sound when your focus casts" option on or off.
+
 ## 1.0.2
 
 ### New Features
